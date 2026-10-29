@@ -1,0 +1,8 @@
+fastapi>=0.162
+uvicorn[standard]>=0.34
+pydantic>=2.14
+pydantic-settings>=2.16.1
+langchain
+langchain-google-genai>=4.4.2
+langgraph
+python-dotenv>=1.2.2

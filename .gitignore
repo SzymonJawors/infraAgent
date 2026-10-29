@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.terraform/
+*.tfstate
+*.tfstate.*
+workspace/.terraform/
+workspace/*.tfstate
+workspace/*.tfstate.*
+*.egg-info/
+dist/
+build/

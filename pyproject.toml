@@ -1,0 +1,22 @@
+[project]
+name = "infraagent"
+version = "0.1.0"
+description = "Conversational agent that writes Terraform and applies it to AWS after confirmation."
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.162",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.14",
+    "pydantic-settings>=2.16.1",
+    "langchain",
+    "langchain-google-genai>=4.4.2",
+    "langgraph",
+    "python-dotenv>=1.2.2",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
