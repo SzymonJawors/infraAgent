@@ -1,11 +1,10 @@
-from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Environment configuration.
 
-    AWS keys are for the Terraform process only. The Gemini key is for the
+    AWS keys are for the Terraform process only. The OpenAI key is for the
     chat model. Neither belongs in prompts, ``.tf`` files, or logs.
     """
 
@@ -13,20 +12,14 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "eu-central-1"
-    google_api_key: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-            "google_api_key",
-        ),
-    )
-    gemini_model: str = "gemini-4-argon"
+    openai_api_key: str = ""
+    openai_model: str = "gpt-5.4-mini"
 
 
 def get_settings() -> Settings:

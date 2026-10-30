@@ -1,1 +1,1 @@
-"""Terraform, workspace scanning, and the Gemini agent."""
+"""Terraform, workspace scanning, and the OpenAI agent."""
