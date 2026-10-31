@@ -2,27 +2,51 @@
 
 ## Polski
 
-InfraAgent zamienia polecenie w języku naturalnym na pliki Terraform dla AWS. Składnia jest sprawdzana przez `terraform validate`. Wdrożenie (`apply`) i kasowanie (`destroy`) nie startują same — mają ruszyć dopiero po Twoim zatwierdzeniu konkretnego planu. Domyślny model to `gpt-5.4-mini`; w `OPENAI_MODEL` można wpisać dowolny identyfikator modelu OpenAI.
+InfraAgent zamienia polecenie w języku naturalnym na konfigurację Terraform dla AWS. Każda sesja ma własny katalog roboczy. Wygenerowana konfiguracja jest formatowana, inicjalizowana i walidowana. Gdy skonfigurowane są poświadczenia AWS, to samo żądanie zwraca także `terraform plan`.
 
-### Co działa teraz
+`apply` i `destroy` nie są dostępne. Te operacje pozostają za jawnym zatwierdzeniem konkretnego planu; ten krok nie jest jeszcze zaimplementowany.
 
-- `GET /health` — życie procesu.
-- `POST /sessions/{session_id}/messages` z ciałem `{"message": "..."}` — model OpenAI pisze pliki `.tf` do `workspace/{session_id}/`, a potem agent odpala `terraform fmt`, `init -backend=false` i `validate`.
-- Gdy walidacja zwróci błąd składni, agent poprawia HCL i próbuje ponownie (do trzech razy).
-- Kolejna wiadomość w tej samej sesji widzi już zapisane pliki.
-- Brak klucza OpenAI daje `503`. Brak binarki `terraform` na PATH nie kasuje plików: odpowiedź ma `missing_binary: true`.
+### Zakres
 
-`session_id` to jedna nazwa katalogu: litery, cyfry, `_` i `-`, do 64 znaków.
+- `GET /health` zwraca `{"status":"ok"}`, gdy proces działa.
+- `POST /sessions/{session_id}/messages` przyjmuje `{"message": "..."}` i zapisuje pliki `.tf` w `workspace/{session_id}/`.
+- Gdy dostępny jest Docker albo binarka `terraform-mcp-server`, agent korzysta z publicznej dokumentacji Terraform Registry przed zapisem plików. Gdy to źródło jest niedostępne, generowanie trwa dalej, a odpowiedź ustawia `registry_docs` na `false`.
+- Po zapisie plików agent uruchamia `terraform fmt`, `terraform init -backend=false` i `terraform validate`. Przy obecnych poświadczeniach AWS uruchamia następnie `terraform plan`.
+- Błąd konfiguracji z `validate` albo `plan` jest poprawiany w wygenerowanym HCL i sprawdzany ponownie, najwyżej trzy razy. Brak CLI, timeout pobierania providera i brak poświadczeń AWS kończą pętlę poprawek.
+- `local-exec`, `remote-exec`, provisionery oraz `data "external"` są odrzucane przed zapisem.
+- Kolejna wiadomość w tej samej sesji odczytuje pliki już zapisane dla tej sesji.
 
-### Czego jeszcze nie ma
+`session_id` to pojedyncza nazwa katalogu: litery, cyfry, `_` i `-`, najwyżej 64 znaki.
 
-- `terraform plan`, `apply` i `destroy` (apply i destroy tylko po jawnym zatwierdzeniu).
-- Skan bezpieczeństwa Checkov albo tfsec.
-- Osobny kontener na CLI Terraforma i skanery. Obecny obraz Dockera uruchamia samą aplikację.
+### Interfejs HTTP
 
-### Uruchomienie
+| Warunek | Wynik |
+| --- | --- |
+| Brak poświadczenia modelu językowego | `503` |
+| Niepoprawny `session_id` | `400` |
+| Brak `terraform` na `PATH` | Pliki zostają. `validation.missing_binary` ma wartość `true`. |
+| Brak poświadczeń AWS | Walidacja nadal się wykonuje. `plan` jest pomijany i nie jest wysyłany do AWS. |
 
-Potrzebny jest Python 3.14.
+Treść odpowiedzi zawiera `reply`, `files`, `validation`, `plan` i `registry_docs`.
+
+Przykład:
+
+```http
+POST /sessions/demo/messages
+Content-Type: application/json
+
+{"message":"Prywatny bucket S3 na backupy, z szyfrowaniem i blokadą publicznego dostępu"}
+```
+
+### Wymagania
+
+- Python 3.14
+- Terraform na `PATH`, jeśli mają działać walidacja i plan
+- Opcjonalnie Docker albo binarka `terraform-mcp-server`, do dokumentacji rejestru
+
+Poświadczenia AWS są wymagane wyłącznie dla `terraform plan`.
+
+### Instalacja
 
 ```powershell
 py -3.14 -m venv .venv
@@ -32,44 +56,79 @@ copy .env.example .env
 uvicorn app.main:app --reload
 ```
 
-- [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health) zwraca `{"status":"ok"}`.
-- Przykład: `POST http://127.0.0.1:8000/sessions/demo/messages` z JSON `{"message":"Prywatny bucket S3 na backupy, z szyfrowaniem i blokadą publicznego dostępu"}`.
+Usługa nasłuchuje na [http://127.0.0.1:8000](http://127.0.0.1:8000). Kontrola życia: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health).
 
-Na PATH musi być `terraform`, jeśli walidacja ma się udać. Klucze AWS nie są potrzebne do samego `validate`.
+Obraz Dockera uruchamia proces API. Nie zawiera CLI Terraform ani skanerów bezpieczeństwa.
 
 ### Konfiguracja
 
-Skopiuj `.env.example` do `.env`.
+Skopiować `.env.example` do `.env`. Pliku `.env` nie należy commitować.
 
-- `OPENAI_API_KEY` — tylko do modelu. Nie trafia do plików `.tf` ani do logów.
-- `OPENAI_MODEL` — domyślnie `gpt-5.4-mini`. Może to być dowolny model OpenAI, na przykład `gpt-5.2` albo `gpt-5-mini`.
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` — przekazywane procesowi Terraform, nie modelowi. Domyślny region to `eu-central-1`.
+| Zmienna | Przeznaczenie |
+| --- | --- |
+| `OPENAI_API_KEY` | Poświadczenie modelu językowego. Nie trafia do plików `.tf` ani do logów. |
+| `OPENAI_MODEL` | Opcjonalny identyfikator modelu. |
+| `AWS_ACCESS_KEY_ID` | Przekazywany wyłącznie procesowi Terraform. |
+| `AWS_SECRET_ACCESS_KEY` | Przekazywany wyłącznie procesowi Terraform. |
+| `AWS_REGION` | Region AWS. Domyślnie `eu-central-1`. |
 
-Pliku `.env` nie commituj.
+### Bezpieczeństwo
+
+Poświadczenia AWS pozostają w środowisku procesu Terraform. Nie trafiają do promptu modelu ani do wygenerowanych plików. Wartości z `.env` są usuwane ze szczegółów błędów API. Provisionery i zewnętrzne źródła danych, które mogłyby uruchomić program podczas `plan`, są odrzucane przy zapisie.
+
+### Dalszy zakres
+
+- `apply` i `destroy`, każde za jawnym zatwierdzeniem konkretnego planu
+- Skan Checkov albo tfsec
+- Obraz kontenera zawierający CLI Terraform i skanery
 
 ## English
 
-InfraAgent turns a natural-language request into Terraform files for AWS. Syntax is checked with `terraform validate`. `apply` and `destroy` do not run on their own — they are meant to start only after you approve a specific plan. The default model is `gpt-5.4-mini`; set `OPENAI_MODEL` to any OpenAI model id.
+InfraAgent turns a natural-language infrastructure request into Terraform for AWS. Each session keeps its own workspace. Generated configuration is formatted, initialized, and validated. When AWS credentials are configured, the same request also produces a `terraform plan`.
 
-### What works now
+`apply` and `destroy` are not available. Those operations stay behind an explicit approval step that is not implemented yet.
 
-- `GET /health` — process liveness.
-- `POST /sessions/{session_id}/messages` with `{"message": "..."}` — the OpenAI model writes `.tf` files under `workspace/{session_id}/`, then the agent runs `terraform fmt`, `init -backend=false`, and `validate`.
-- If validation reports a syntax error, the agent rewrites the HCL and tries again (up to three times).
-- A later message in the same session sees the files already on disk.
-- A missing OpenAI key returns `503`. A missing `terraform` binary does not delete the files: the response sets `missing_binary: true`.
+## Capabilities
 
-`session_id` is a single directory name: letters, digits, `_` and `-`, up to 64 characters.
+- `GET /health` returns `{"status":"ok"}` when the process is running.
+- `POST /sessions/{session_id}/messages` accepts `{"message": "..."}` and writes `.tf` files under `workspace/{session_id}/`.
+- When Docker or the `terraform-mcp-server` binary is available, the agent consults public Terraform Registry documentation before writing files. If that source is unavailable, generation continues and the response sets `registry_docs` to `false`.
+- After the files are written, the agent runs `terraform fmt`, `terraform init -backend=false`, and `terraform validate`. With AWS credentials present, it then runs `terraform plan`.
+- A configuration error from `validate` or `plan` is corrected in the generated HCL and checked again, up to three times. Missing CLI, a provider download timeout, and missing AWS credentials stop the retry loop.
+- `local-exec`, `remote-exec`, provisioners, and `data "external"` are rejected before they are written.
+- A later message in the same session reads the files already stored for that session.
 
-### Not built yet
+`session_id` is a single directory name: letters, digits, `_`, and `-`, at most 64 characters.
 
-- `terraform plan`, `apply`, and `destroy` (`apply` and `destroy` only after an explicit approval).
-- A Checkov or tfsec security scan.
-- A separate container for the Terraform CLI and scanners. The current Docker image runs the app only.
+## HTTP interface
 
-### Run
+| Condition | Result |
+| --- | --- |
+| Missing language-model credential | `503` |
+| Invalid `session_id` | `400` |
+| `terraform` missing from `PATH` | Files are kept. `validation.missing_binary` is `true`. |
+| AWS credentials absent | Validation still runs. `plan` is skipped and is not sent to AWS. |
 
-Python 3.14 is required.
+The response body contains `reply`, `files`, `validation`, `plan`, and `registry_docs`.
+
+Example:
+
+```http
+POST /sessions/demo/messages
+Content-Type: application/json
+
+{"message":"Private S3 bucket for backups, encrypted, with public access blocked"}
+```
+
+## Requirements
+
+- Python 3.14
+- Terraform on `PATH` for validation and plan
+- Optional: Docker, or a `terraform-mcp-server` binary, for registry documentation
+
+AWS credentials are required only for `terraform plan`.
+
+## Installation
 
 ```powershell
 py -3.14 -m venv .venv
@@ -79,17 +138,28 @@ copy .env.example .env
 uvicorn app.main:app --reload
 ```
 
-- [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health) returns `{"status":"ok"}`.
-- Example: `POST http://127.0.0.1:8000/sessions/demo/messages` with `{"message":"Private S3 bucket for backups, encrypted, public access blocked"}`.
+The service listens on [http://127.0.0.1:8000](http://127.0.0.1:8000). Health check: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health).
 
-`terraform` must be on `PATH` for validation to succeed. AWS keys are not required for `validate`.
+The Docker image runs the API process. It does not include the Terraform CLI or security scanners.
 
-### Configuration
+## Configuration
 
-Copy `.env.example` to `.env`.
+Copy `.env.example` to `.env`. Do not commit `.env`.
 
-- `OPENAI_API_KEY` — model only. It is not written into `.tf` files or logs.
-- `OPENAI_MODEL` — default `gpt-5.4-mini`. Any OpenAI model id works, for example `gpt-5.2` or `gpt-5-mini`.
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` — passed to the Terraform process, not to the model. Default region is `eu-central-1`.
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` | Credential for the language model. It is not written into `.tf` files or logs. |
+| `OPENAI_MODEL` | Optional model identifier. |
+| `AWS_ACCESS_KEY_ID` | Passed only to the Terraform process. |
+| `AWS_SECRET_ACCESS_KEY` | Passed only to the Terraform process. |
+| `AWS_REGION` | AWS region. Default: `eu-central-1`. |
 
-Do not commit `.env`.
+## Security
+
+AWS credentials stay in the process environment used by Terraform. They are not placed in the model prompt or in generated files. Values from `.env` are redacted from API error details. Provisioners and external data sources that could execute a program during `plan` are rejected at write time.
+
+## Roadmap
+
+- `apply` and `destroy`, each gated by an explicit approval of a specific plan
+- Checkov or tfsec scanning
+- A container image that includes the Terraform CLI and scanners

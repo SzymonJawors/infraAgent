@@ -22,6 +22,8 @@ class MessageResponse(BaseModel):
     reply: str
     files: list[str]
     validation: ValidationBody
+    plan: ValidationBody
+    registry_docs: bool
 
 
 @router.post("/sessions/{session_id}/messages", response_model=MessageResponse)
@@ -51,9 +53,27 @@ def _response(turn: AgentTurn) -> MessageResponse:
         validation=ValidationBody(
             ok=turn.validation.ok,
             missing_binary=turn.validation.missing_binary,
-            output=turn.validation.output(),
+            output=_redact(turn.validation.output()),
         ),
+        plan=ValidationBody(
+            ok=turn.plan.ok,
+            missing_binary=turn.plan.missing_binary,
+            output=_redact(turn.plan.output()),
+        ),
+        registry_docs=turn.registry_docs,
     )
+
+
+def _redact(text: str) -> str:
+    settings = get_settings()
+    for secret in (
+        settings.openai_api_key,
+        settings.aws_secret_access_key,
+        settings.aws_access_key_id,
+    ):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return text
 
 
 def _safe_detail(exc: Exception, settings: Settings) -> str:

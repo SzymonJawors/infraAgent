@@ -5,6 +5,8 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from app.core.config import Settings
+from app.services.hcl_guard import rejected_hcl
+from app.services.registry import load_registry_tools
 from app.services.scanner import WorkspaceScanner
 from app.services.terraform import CommandResult, TerraformService
 
@@ -12,14 +14,17 @@ _SYSTEM_PROMPT = """You are InfraAgent. You write Terraform (HCL) for AWS from t
 
 Rules:
 - Reply in the user's language.
+- When registry documentation tools are available, look up the resource before writing it.
 - Write only files whose names end in .tf, with no directories.
 - Keep editing the files already in the session. Do not start over unless the user asks.
-- AWS credentials come from the process environment. Never put access keys, secret keys, or passwords in .tf files.
+- AWS credentials stay in the Terraform process environment. Never put access keys, secret keys, or passwords in .tf files.
+- Do not use local-exec, remote-exec, provisioner, or external data sources.
 - Prefer private subnets, encryption at rest, and blocked public access.
 - Do not open 0.0.0.0/0 unless the user explicitly demands a public endpoint, and then say so in the reply.
-- After writing files, call validate_terraform.
-- If validation fails because of HCL, fix the files and validate again. Stop after three validation attempts.
-- If the CLI is missing or provider download fails, do not keep rewriting. Explain that in the reply.
+- Declare every provider you use in required_providers, including hashicorp/random when you use random_id.
+- After writing files, call check_infrastructure.
+- If the result says configuration error, fix the HCL and check again. Stop after three checks.
+- If the result says do not rewrite, explain that error and stop.
 - Do not run apply or destroy. Tell the user those wait for an explicit approval later.
 """
 
@@ -31,6 +36,8 @@ class AgentTurn:
     reply: str
     files: list[str]
     validation: CommandResult
+    plan: CommandResult
+    registry_docs: bool
 
 
 class InfraAgent:
@@ -50,9 +57,9 @@ class InfraAgent:
             name = Path(filename).name
             if name != filename or not name.endswith(".tf") or name in {".tf"}:
                 return "Rejected: only a plain *.tf filename is allowed."
-            lowered = content.lower()
-            if "aws_secret_access_key" in lowered or "aws_access_key_id" in lowered:
-                return "Rejected: do not put AWS credentials in Terraform files."
+            rejected = rejected_hcl(content)
+            if rejected:
+                return rejected
             target = (self.workspace / name).resolve()
             if target.parent != self.workspace.resolve():
                 return "Rejected: path escapes the session directory."
@@ -66,24 +73,31 @@ class InfraAgent:
             existing = scanner.read()
             return existing or "Workspace is empty."
 
-        def validate_terraform() -> str:
-            """Run terraform fmt, init -backend=false, and validate."""
+        def check_infrastructure() -> str:
+            """Validate the files and run terraform plan when AWS credentials exist."""
             attempts["n"] += 1
             if attempts["n"] > _MAX_VALIDATE:
-                return "Validation attempt limit reached. Stop and summarize the remaining error."
-            result = terraform.check()
-            status = "ok" if result.ok else "failed"
-            if result.missing_binary:
-                status = "terraform CLI missing"
-            return f"{status}\n{result.command}\n{result.output()}".strip()
+                return "Check attempt limit reached. Stop and summarize the remaining error."
+            validation, plan = terraform.review()
+            body = (
+                f"validation {'ok' if validation.ok else 'failed'}\n{validation.output()}\n"
+                f"plan {'ok' if plan.ok else 'failed'}\n{plan.output()}"
+            ).strip()
+            stop = _non_retryable(validation, plan)
+            if stop:
+                return f"Do not rewrite the files. {stop}\n{body}"
+            if validation.ok and plan.ok:
+                return f"ok\n{body}"
+            return f"configuration error, fix the HCL and check again\n{body}"
 
+        registry_tools, registry_docs = load_registry_tools()
         model = ChatOpenAI(
             model=self.settings.openai_model,
             api_key=self.settings.openai_api_key,
         )
         graph = create_agent(
             model=model,
-            tools=[write_tf, read_workspace, validate_terraform],
+            tools=[write_tf, read_workspace, check_infrastructure, *registry_tools],
             system_prompt=_SYSTEM_PROMPT,
         )
         existing = scanner.read()
@@ -92,24 +106,46 @@ class InfraAgent:
             user_text = f"{message}\n\nExisting Terraform files:\n{existing}"
         result = graph.invoke(
             {"messages": [{"role": "user", "content": user_text}]},
-            config={"recursion_limit": 20},
+            config={"recursion_limit": 30},
         )
-        validation = (
-            terraform.check()
-            if scanner.files()
-            else CommandResult(
+        if scanner.files():
+            validation, plan = terraform.review()
+        else:
+            validation = CommandResult(
                 ok=False,
                 command="terraform validate",
                 stdout="",
                 stderr="No Terraform files were written.",
                 returncode=None,
             )
-        )
+            plan = CommandResult(
+                ok=False,
+                command="terraform plan",
+                stdout="",
+                stderr="Skipped because no Terraform files were written.",
+                returncode=None,
+            )
+        reply = _last_reply(result["messages"])
+        if not registry_docs:
+            reply = f"{reply}\n\nTerraform registry documentation was unavailable.".strip()
         return AgentTurn(
-            reply=_last_reply(result["messages"]),
+            reply=reply,
             files=scanner.files(),
             validation=validation,
+            plan=plan,
+            registry_docs=registry_docs,
         )
+
+
+def _non_retryable(validation: CommandResult, plan: CommandResult) -> str | None:
+    text = f"{validation.output()}\n{plan.output()}".lower()
+    if validation.missing_binary:
+        return "terraform CLI is missing"
+    if "timed out" in text:
+        return "provider download timed out"
+    if "aws credentials are not configured" in text or "no valid credential sources" in text:
+        return "AWS credentials are missing"
+    return None
 
 
 def _last_reply(messages: list) -> str:

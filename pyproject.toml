@@ -10,6 +10,7 @@ dependencies = [
     "pydantic-settings>=2.16.1",
     "langchain",
     "langchain-openai",
+    "langchain-mcp-adapters",
     "langgraph",
     "python-dotenv>=1.2.2",
 ]
