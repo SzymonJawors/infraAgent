@@ -11,3 +11,4 @@ workspace/*.tfstate.*
 *.egg-info/
 dist/
 build/
+keepinmind.txt

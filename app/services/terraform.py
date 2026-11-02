@@ -34,9 +34,10 @@ def _skipped_plan(reason: str) -> CommandResult:
 
 
 class TerraformService:
-    """Runs fmt, init, and validate against one session directory.
+    """Runs Terraform in one session directory.
 
-    ``apply`` and ``destroy`` are intentionally absent. Secrets are copied
+    Chat review stops at plan. ``apply`` and ``destroy`` run only when an
+    HTTP handler has already checked an approval receipt. Secrets are copied
     into the child environment and never written to ``.tf`` files.
     """
 
@@ -65,7 +66,7 @@ class TerraformService:
         validation = self.check()
         if not validation.ok:
             return validation, _skipped_plan("Skipped because validation did not pass.")
-        if not self.settings.aws_access_key_id or not self.settings.aws_secret_access_key:
+        if not self._has_aws():
             return validation, _skipped_plan(
                 "AWS credentials are not configured. Plan was not sent to AWS."
             )
@@ -74,6 +75,32 @@ class TerraformService:
             timeout=max(self.timeout, 180),
         )
         return validation, planned
+
+    def plan_destroy(self) -> CommandResult:
+        """Show what destroy would remove. This does not delete resources."""
+        if not self._has_aws():
+            return _skipped_plan(
+                "AWS credentials are not configured. Plan was not sent to AWS."
+            )
+        return self._run(
+            ["terraform", "plan", "-destroy", "-input=false", "-no-color", "-lock=false"],
+            timeout=max(self.timeout, 180),
+        )
+
+    def apply(self) -> CommandResult:
+        return self._run(
+            ["terraform", "apply", "-input=false", "-auto-approve", "-no-color", "-lock=false"],
+            timeout=max(self.timeout, 900),
+        )
+
+    def destroy(self) -> CommandResult:
+        return self._run(
+            ["terraform", "destroy", "-input=false", "-auto-approve", "-no-color", "-lock=false"],
+            timeout=max(self.timeout, 900),
+        )
+
+    def _has_aws(self) -> bool:
+        return bool(self.settings.aws_access_key_id and self.settings.aws_secret_access_key)
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()

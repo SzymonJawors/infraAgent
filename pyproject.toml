@@ -12,6 +12,7 @@ dependencies = [
     "langchain-openai",
     "langchain-mcp-adapters",
     "langgraph",
+    "checkov",
     "python-dotenv>=1.2.2",
 ]
 
