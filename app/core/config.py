@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     aws_region: str = "eu-central-1"
     openai_api_key: str = ""
     openai_model: str = "gpt-5.4-mini"
+    braintrust_api_key: str = ""
 
 
 def get_settings() -> Settings:

@@ -89,8 +89,11 @@ Poświadczenia AWS pozostają w środowisku procesu Terraform. Nie trafiają do 
 
 ### Dalszy zakres
 
-- Ewaluacje na zestawie poleceń, z lokalnym sprawdzeniem HCL
 - Obraz kontenera zawierający CLI Terraform i skanery
+
+### Ewaluacje
+
+`python -m evals.run_eval` puszcza trzy polecenia na modelu, każde w osobnym katalogu tymczasowym. Klucze AWS są na czas przebiegu usuwane, a `apply` nie jest wołane. Wynik liczy lokalny kod: brak sekretów i provisionerów, brak wysłanego planu, a dla pełnego polecenia także walidacja i brak publicznego dostępu. Brak regionu ma skończyć się pytaniem, bez plików. Gdy ustawione jest `BRAINTRUST_API_KEY`, te same wyniki 0/1 trafiają do eksperymentu `InfraAgent`. Bez klucza przebieg zostaje na konsoli.
 
 ## English
 
@@ -181,5 +184,8 @@ AWS credentials stay in the process environment used by Terraform. They are not 
 
 ## Roadmap
 
-- Evaluations over a set of requests, scored by local HCL checks
 - A container image that includes the Terraform CLI and scanners
+
+## Evaluations
+
+`python -m evals.run_eval` sends three requests to the model, each in its own temporary directory. AWS credentials are removed for the run, and `apply` is not called. Local checks score the result: no secrets, no provisioners, no plan sent to AWS, and, for a complete request, a passing validation and no public access. A request without a region should end as one question and no files. When `BRAINTRUST_API_KEY` is set, the same 0/1 scores are sent to an `InfraAgent` experiment. Without the key, the run stays on the console.

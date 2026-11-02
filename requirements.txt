@@ -7,4 +7,5 @@ langchain-openai
 langchain-mcp-adapters
 langgraph
 checkov
+braintrust
 python-dotenv>=1.2.2
