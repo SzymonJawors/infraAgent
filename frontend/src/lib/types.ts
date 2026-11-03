@@ -16,6 +16,11 @@ export type MessageResponse = {
   changes: FileChange[]
 }
 
+export type MessageRequest = {
+  message: string
+  skip_checkov?: boolean
+}
+
 export type AgentJobStatus = {
   status: 'idle' | 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed'
   progress: AgentProgress[]
@@ -30,6 +35,9 @@ export type OperationRecord = {
   started_at: string
   finished_at?: string | null
   summary: string
+  command: string
+  output: string
+  ok?: boolean | null
 }
 
 export type FileChange = {
@@ -59,8 +67,18 @@ export type CommandResponse = {
   ok: boolean
   command: string
   output: string
-  status?: 'completed' | 'no_managed_resources' | 'failed'
+  status?: 'running' | 'completed' | 'no_managed_resources' | 'failed' | 'cancelled'
+  operation_id?: number | null
   plan_summary?: PlanSummary | null
+  error_analysis?: ErrorAnalysis | null
+}
+
+export type ErrorAnalysis = {
+  category: string
+  title: string
+  explanation: string
+  recommendation: string
+  resource?: string | null
 }
 
 export type WorkspaceFile = {
@@ -79,6 +97,11 @@ export type ChatMessage = {
   id: number
   role: 'user' | 'assistant' | 'error'
   text: string
+}
+
+export type ConversationMessage = {
+  role: 'user' | 'assistant'
+  content: string
 }
 
 export type AgentProgress = {

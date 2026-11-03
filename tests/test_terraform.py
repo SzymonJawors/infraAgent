@@ -20,6 +20,7 @@ class TerraformEnvironmentTests(unittest.TestCase):
             config = CLI_CONFIG_PATH.read_text(encoding="utf-8")
             self.assertIn("filesystem_mirror", config)
             self.assertIn(PLUGIN_CACHE_DIR.as_posix(), config)
+            self.assertIn("direct {}", config)
 
     def test_destroy_runs_after_termination_protection_is_removed(self) -> None:
         service = TerraformService(Path("C:/tmp/session"), Settings(aws_region="eu-central-1"))

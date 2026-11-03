@@ -16,6 +16,8 @@ from app.api.schemas import (
     ApprovalRequest,
     AgentJobStatus,
     CommandBody,
+    ConversationMessage,
+    ConversationResponse,
     FileBody,
     FilesResponse,
     MessageRequest,
@@ -29,6 +31,7 @@ from app.api.schemas import (
     FileChange,
     OperationHistory,
     OperationRecord,
+    ErrorAnalysisBody,
 )
 from app.services.agent import AgentCancelled, AgentTurn, InfraAgent
 from app.services.approval import (
@@ -41,6 +44,7 @@ from app.services.scanner import WorkspaceScanner
 from app.services.sessions import (
     delete_session,
     finish_operation,
+    get_operation,
     list_operations,
     list_sessions,
     rename_session,
@@ -48,15 +52,22 @@ from app.services.sessions import (
     session_dir,
     start_operation,
     touch_session,
+    update_operation_output,
 )
 from app.services.terraform import TerraformService
 from app.services.pricing import AwsPricing
-from app.services.workspace_lock import workspace_lease
+from app.services.workspace_lock import WorkspaceBusyError, workspace_lease
+from app.services.error_analysis import analyze_terraform_error
+from app.services.agent_context import read_conversation
+from app.services.agent_context import detect_region, provider_region, write_conversation
 
 router = APIRouter()
 _JOB_STATUS_FILE = ".agent-job.json"
 _JOB_LOCK = threading.Lock()
 _JOB_EVENTS: dict[str, threading.Event] = {}
+_OPERATION_RESULTS: dict[tuple[str, int], CommandBody] = {}
+_OPERATION_RESULTS_LOCK = threading.Lock()
+_ACTIVE_SERVICES: dict[tuple[str, int], TerraformService] = {}
 
 
 def _job_status_path(workspace: Path) -> Path:
@@ -84,18 +95,59 @@ def _run_agent(
     message: str,
     publish,
     cancel_event: threading.Event,
+    skip_checkov: bool = False,
 ) -> AgentTurn:
     try:
-        return agent.run(message, on_progress=publish, cancel_event=cancel_event)
+        return agent.run(
+            message,
+            on_progress=publish,
+            cancel_event=cancel_event,
+            skip_checkov=skip_checkov,
+        )
     except TypeError as exc:
-        if "unexpected keyword argument 'cancel_event'" not in str(exc):
+        if "unexpected keyword argument" not in str(exc):
             raise
         return agent.run(message, on_progress=publish)
+
+
+def _region_clarification(workspace: Path, message: str) -> MessageResponse | None:
+    existing = WorkspaceScanner(workspace).read()
+    if detect_region(message) or provider_region(existing):
+        return None
+    reply = (
+        "Which AWS region should I create the infrastructure in? "
+        "For example: `eu-central-1` (Frankfurt) or `us-east-1`."
+    )
+    write_conversation(
+        workspace / ".agent-conversation.json",
+        [
+            *read_conversation(workspace / ".agent-conversation.json"),
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": reply},
+        ],
+    )
+    empty = ValidationBody(ok=True, missing_binary=False, output="")
+    return MessageResponse(
+        reply=reply,
+        files=WorkspaceScanner(workspace).files(),
+        validation=empty,
+        plan=empty,
+        scan=empty,
+        registry_docs=False,
+    )
 
 
 @router.get("/sessions", response_model=SessionsResponse)
 def get_sessions() -> SessionsResponse:
     return SessionsResponse(sessions=list_sessions())
+
+
+@router.post("/sessions/{session_id}", response_model=SessionSummary, status_code=201)
+def create_session(session_id: str) -> SessionSummary:
+    workspace = _workspace_or_400(session_id, create=True)
+    del workspace
+    session = next(item for item in list_sessions() if item["id"] == session_id)
+    return SessionSummary(**session)
 
 
 @router.get("/sessions/{session_id}/status", response_model=SessionStatus)
@@ -117,6 +169,15 @@ def get_session_status(session_id: str) -> SessionStatus:
         status="applied" if resources else "empty",
         terraform_state=True,
         managed_resources=len(resources),
+    )
+
+
+@router.get("/sessions/{session_id}/conversation", response_model=ConversationResponse)
+def get_conversation(session_id: str) -> ConversationResponse:
+    workspace = _workspace_or_400(session_id)
+    messages = read_conversation(workspace / ".agent-conversation.json")
+    return ConversationResponse(
+        messages=[ConversationMessage(**message) for message in messages]
     )
 
 
@@ -144,6 +205,36 @@ def get_operations(session_id: str) -> OperationHistory:
     _workspace_or_400(session_id)
     return OperationHistory(
         operations=[OperationRecord(**item) for item in list_operations(session_id)]
+    )
+
+
+@router.get("/sessions/{session_id}/operations/{operation_id}", response_model=CommandBody)
+def get_operation_result(session_id: str, operation_id: int) -> CommandBody:
+    _workspace_or_400(session_id)
+    with _OPERATION_RESULTS_LOCK:
+        result = _OPERATION_RESULTS.get((session_id, operation_id))
+    if result is not None:
+        return result
+    operation = next(
+        (item for item in list_operations(session_id) if item["id"] == operation_id),
+        None,
+    )
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Operation not found")
+    if operation["status"] == "running":
+        return CommandBody(
+            ok=True,
+            command=f"terraform {operation['kind']}",
+            output=str(operation.get("output") or "Terraform operation is still running."),
+            status="running",
+            operation_id=operation_id,
+        )
+    return CommandBody(
+        ok=operation["ok"] if operation["ok"] is not None else operation["status"] == "completed",
+        command=str(operation["command"] or f"terraform {operation['kind']}"),
+        output=str(operation["output"] or operation["summary"] or "Terraform operation finished."),
+        status="completed" if operation["status"] == "completed" else "failed",
+        operation_id=operation_id,
     )
 
 
@@ -182,15 +273,26 @@ def post_message(session_id: str, body: MessageRequest) -> MessageResponse:
         raise HTTPException(status_code=503, detail="OpenAI API key is not configured")
 
     workspace = session_dir(session_id)
-    touch_session(session_id, body.message[:60])
+    touch_session(session_id)
+    clarification = _region_clarification(workspace, body.message)
+    if clarification:
+        return clarification
     try:
         with workspace_lease(workspace):
             before = _workspace_snapshot(workspace)
             clear_receipts(workspace)
-            turn = InfraAgent(workspace, settings).run(body.message)
+            turn = InfraAgent(workspace, settings).run(
+                body.message,
+                skip_checkov=body.skip_checkov,
+            )
             if turn.plan.ok and turn.scan.ok:
                 write_receipt(workspace, "apply")
             response = _response(turn, _workspace_changes(workspace, before))
+    except WorkspaceBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="This workspace is already processing another operation. Wait for it to finish or restart the backend if no operation is active.",
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=_safe_detail(exc, settings)) from exc
     return response
@@ -209,7 +311,16 @@ def post_message_stream(session_id: str, body: MessageRequest) -> StreamingRespo
 
     workspace = session_dir(session_id)
     before = _workspace_snapshot(workspace)
-    touch_session(session_id, body.message[:60])
+    touch_session(session_id)
+    clarification = _region_clarification(workspace, body.message)
+    if clarification:
+        events: queue.Queue[tuple[str, dict[str, object]] | None] = queue.Queue()
+        events.put(("result", clarification.model_dump()))
+        events.put(None)
+        return StreamingResponse(
+            _stream_events(events),
+            media_type="text/event-stream",
+        )
     clear_receipts(workspace)
     _write_job_status(workspace, AgentJobStatus(status="running"))
     cancel_event = threading.Event()
@@ -236,7 +347,13 @@ def post_message_stream(session_id: str, body: MessageRequest) -> StreamingRespo
 
     def run_agent() -> None:
         try:
-            turn = _run_agent(InfraAgent(workspace, settings), body.message, publish, cancel_event)
+            turn = _run_agent(
+                InfraAgent(workspace, settings),
+                body.message,
+                publish,
+                cancel_event,
+                body.skip_checkov,
+            )
             if turn.plan.ok and turn.scan.ok:
                 write_receipt(workspace, "apply")
             response = _response(turn, _workspace_changes(workspace, before))
@@ -287,7 +404,12 @@ async def post_message_websocket(websocket: WebSocket, session_id: str) -> None:
         return
     workspace = session_dir(session_id)
     before = _workspace_snapshot(workspace)
-    touch_session(session_id, body.message[:60])
+    touch_session(session_id)
+    clarification = _region_clarification(workspace, body.message)
+    if clarification:
+        await websocket.send_json({"type": "result", "data": clarification.model_dump()})
+        await websocket.close()
+        return
     clear_receipts(workspace)
     cancel_event = threading.Event()
     with _JOB_LOCK:
@@ -313,7 +435,13 @@ async def post_message_websocket(websocket: WebSocket, session_id: str) -> None:
 
     def run_agent() -> None:
         try:
-            turn = _run_agent(InfraAgent(workspace, settings), body.message, publish, cancel_event)
+            turn = _run_agent(
+                InfraAgent(workspace, settings),
+                body.message,
+                publish,
+                cancel_event,
+                body.skip_checkov,
+            )
             if turn.plan.ok and turn.scan.ok:
                 write_receipt(workspace, "apply")
             response = _response(turn, _workspace_changes(workspace, before))
@@ -324,6 +452,14 @@ async def post_message_websocket(websocket: WebSocket, session_id: str) -> None:
             error = str(exc)
             _write_job_status(workspace, AgentJobStatus(status="cancelled", error=error))
             finish_operation(session_id, operation_id, "cancelled", error)
+            events.put(("error", {"message": error}))
+        except WorkspaceBusyError:
+            error = (
+                "This workspace is already processing another operation. "
+                "Wait for it to finish before sending another request."
+            )
+            _write_job_status(workspace, AgentJobStatus(status="failed", error=error))
+            finish_operation(session_id, operation_id, "failed", error)
             events.put(("error", {"message": error}))
         except Exception as exc:
             error = _safe_detail(exc, settings)
@@ -380,19 +516,66 @@ def post_destroy_plan(session_id: str) -> CommandBody:
         drop_receipt(workspace, "destroy")
         raise HTTPException(status_code=503, detail="AWS credentials are not configured")
     operation_id = start_operation(session_id, "destroy-plan")
-    try:
-        with workspace_lease(workspace):
-            result = TerraformService(workspace, settings).plan_destroy()
-            if result.ok and _destroy_plan_has_changes(result.output()):
+    output_buffer: list[str] = []
+
+    def publish(line: str, command: str) -> None:
+        output_buffer.append(line)
+        update_operation_output(session_id, operation_id, "\n".join(output_buffer), command=command)
+
+    service = TerraformService(workspace, settings, on_output=publish)
+    _ACTIVE_SERVICES[(session_id, operation_id)] = service
+    completed = threading.Event()
+    result_holder: dict[str, CommandBody] = {}
+
+    def run_plan() -> None:
+        try:
+            result = service.plan_destroy()
+            if result.ok and _destroy_plan_has_changes(result.full_output()):
                 write_receipt(workspace, "destroy")
             else:
                 drop_receipt(workspace, "destroy")
-    except Exception as exc:
-        finish_operation(session_id, operation_id, "failed", _safe_detail(exc, settings))
-        raise HTTPException(status_code=502, detail=_safe_detail(exc, settings)) from exc
-    body = _command_body(result)
-    finish_operation(session_id, operation_id, "completed" if result.ok else "failed", body.status)
-    return body
+            final_body = _command_body(result, operation_id)
+            cancelled = (get_operation(session_id, operation_id) or {}).get("status") == "cancelled"
+            if cancelled:
+                final_body = final_body.model_copy(
+                    update={"ok": False, "status": "cancelled", "output": "Terraform operation cancelled."}
+                )
+            finish_operation(
+                session_id,
+                operation_id,
+                "cancelled" if cancelled else ("completed" if result.ok else "failed"),
+                "Cancellation requested." if cancelled else final_body.status,
+                command=final_body.command,
+                output=final_body.output,
+                ok=final_body.ok,
+            )
+        except Exception as exc:
+            detail = _safe_detail(exc, settings)
+            cancelled = (get_operation(session_id, operation_id) or {}).get("status") == "cancelled"
+            finish_operation(session_id, operation_id, "cancelled" if cancelled else "failed", detail)
+            final_body = CommandBody(
+                ok=False,
+                command="terraform plan -destroy",
+                output=detail,
+                status="cancelled" if cancelled else "failed",
+                operation_id=operation_id,
+            )
+        with _OPERATION_RESULTS_LOCK:
+            _OPERATION_RESULTS[(session_id, operation_id)] = final_body
+        _ACTIVE_SERVICES.pop((session_id, operation_id), None)
+        result_holder["body"] = final_body
+        completed.set()
+
+    threading.Thread(target=run_plan, daemon=True).start()
+    if completed.wait(0.05):
+        return result_holder["body"]
+    return CommandBody(
+        ok=True,
+        command="terraform plan -destroy",
+        output="Terraform destroy preview started.",
+        status="running",
+        operation_id=operation_id,
+    )
 
 
 @router.post("/sessions/{session_id}/apply", response_model=CommandBody)
@@ -406,9 +589,9 @@ def post_destroy(session_id: str, body: ApprovalRequest) -> CommandBody:
 
 
 def _response(turn: AgentTurn, changes: list[FileChange] | None = None) -> MessageResponse:
-    summary = _plan_summary(_redact(turn.plan.output()))
+    summary = _plan_summary(_redact(turn.plan.full_output()))
     if turn.plan.ok:
-        estimate = AwsPricing(get_settings()).estimate(_redact(turn.plan.output()))
+        estimate = AwsPricing(get_settings()).estimate(_redact(turn.plan.full_output()))
         summary = summary.model_copy(update={
             "estimated_monthly_usd": estimate.monthly_usd,
             "pricing_status": estimate.status,
@@ -420,19 +603,19 @@ def _response(turn: AgentTurn, changes: list[FileChange] | None = None) -> Messa
         validation=ValidationBody(
             ok=turn.validation.ok,
             missing_binary=turn.validation.missing_binary,
-            output=_redact(turn.validation.output()),
+            output=_redact(turn.validation.full_output()),
             policy_warnings=turn.validation.policy_warnings,
         ),
         plan=ValidationBody(
             ok=turn.plan.ok,
             missing_binary=turn.plan.missing_binary,
-            output=_redact(turn.plan.output()),
+            output=_redact(turn.plan.full_output()),
             policy_warnings=turn.plan.policy_warnings,
         ),
         scan=ValidationBody(
             ok=turn.scan.ok,
             missing_binary=turn.scan.missing_binary,
-            output=_redact(turn.scan.output()),
+            output=_redact(turn.scan.full_output()),
             policy_warnings=turn.scan.policy_warnings,
         ),
         registry_docs=turn.registry_docs,
@@ -541,24 +724,80 @@ def _run_approved(session_id: str, body: ApprovalRequest, kind: str) -> CommandB
             status_code=409,
             detail=f"No matching {kind} plan for the current files",
         )
-    service = TerraformService(workspace, settings)
     operation_id = start_operation(session_id, kind)
-    try:
-        with workspace_lease(workspace):
+    output_buffer: list[str] = []
+
+    def publish(line: str, command: str) -> None:
+        output_buffer.append(line)
+        update_operation_output(session_id, operation_id, "\n".join(output_buffer), command=command)
+
+    service = TerraformService(workspace, settings, on_output=publish)
+    _ACTIVE_SERVICES[(session_id, operation_id)] = service
+
+    def run_operation() -> None:
+        try:
             result = service.apply() if kind == "apply" else service.destroy()
             if result.ok:
                 drop_receipt(workspace, "apply")
                 drop_receipt(workspace, "destroy")
-    except Exception as exc:
-        finish_operation(session_id, operation_id, "failed", _safe_detail(exc, settings))
-        raise HTTPException(status_code=502, detail=_safe_detail(exc, settings)) from exc
-    body = _command_body(result)
-    finish_operation(session_id, operation_id, "completed" if result.ok else "failed", body.status)
-    return body
+            final_body = _command_body(result, operation_id)
+            cancelled = (get_operation(session_id, operation_id) or {}).get("status") == "cancelled"
+            if cancelled:
+                final_body = final_body.model_copy(
+                    update={"ok": False, "status": "cancelled", "output": "Terraform operation cancelled."}
+                )
+            with _OPERATION_RESULTS_LOCK:
+                _OPERATION_RESULTS[(session_id, operation_id)] = final_body
+            finish_operation(
+                session_id,
+                operation_id,
+                "cancelled" if cancelled else ("completed" if result.ok else "failed"),
+                "Cancellation requested." if cancelled else final_body.status,
+                command=final_body.command,
+                output=final_body.output,
+                ok=final_body.ok,
+            )
+        except Exception as exc:
+            detail = _safe_detail(exc, settings)
+            cancelled = (get_operation(session_id, operation_id) or {}).get("status") == "cancelled"
+            finish_operation(session_id, operation_id, "cancelled" if cancelled else "failed", detail)
+            final_body = CommandBody(
+                ok=False,
+                command=f"terraform {kind}",
+                output=detail,
+                status="cancelled" if cancelled else "failed",
+                operation_id=operation_id,
+            )
+            with _OPERATION_RESULTS_LOCK:
+                _OPERATION_RESULTS[(session_id, operation_id)] = final_body
+        _ACTIVE_SERVICES.pop((session_id, operation_id), None)
+
+    threading.Thread(target=run_operation, daemon=True).start()
+    return CommandBody(
+        ok=True,
+        command=f"terraform {kind}",
+        output="Terraform operation started. Waiting for AWS/Terraform to finish.",
+        status="running",
+        operation_id=operation_id,
+    )
 
 
-def _command_body(result) -> CommandBody:
-    output = _redact(result.output())
+@router.post("/sessions/{session_id}/operations/{operation_id}/cancel", response_model=OperationRecord)
+def cancel_operation(session_id: str, operation_id: int) -> OperationRecord:
+    _workspace_or_400(session_id)
+    service = _ACTIVE_SERVICES.get((session_id, operation_id))
+    if service is None:
+        raise HTTPException(status_code=409, detail="Operation is not running")
+    service.cancel()
+    finish_operation(session_id, operation_id, "cancelled", "Cancellation requested.")
+    operation = next(
+        item for item in list_operations(session_id) if item["id"] == operation_id
+    )
+    return OperationRecord(**operation)
+
+
+def _command_body(result, operation_id: int | None = None) -> CommandBody:
+    output = _redact(result.full_output())
     status = "completed"
     is_destroy = _is_destroy_command(result.command)
     if is_destroy and not _destroy_plan_has_changes(output):
@@ -566,7 +805,17 @@ def _command_body(result) -> CommandBody:
     elif not result.ok:
         status = "failed"
     summary = _plan_summary(output, destroy=is_destroy) if is_destroy else None
-    return CommandBody(ok=result.ok, command=result.command, output=output, status=status, plan_summary=summary)
+    raw_analysis = analyze_terraform_error(output, result.command) if not result.ok else None
+    analysis = ErrorAnalysisBody(**raw_analysis.__dict__) if raw_analysis else None
+    return CommandBody(
+        ok=result.ok,
+        command=result.command,
+        output=output,
+        status=status,
+        operation_id=operation_id,
+        plan_summary=summary,
+        error_analysis=analysis,
+    )
 
 
 def _is_destroy_command(command: str) -> bool:

@@ -10,8 +10,13 @@ type InspectorProps = {
   busy: string | null
   lastCommand: CommandResponse | null
   onAction: (path: string, label: string) => void
+  onOpenFile: () => void
+  onShowOutput: () => void
   changes: FileChange[]
   sessionStatus: SessionStatus | null
+  runCheckov: boolean
+  onRunCheckovChange: (value: boolean) => void
+  onCancelOperation: () => void
 }
 
 export function Inspector({
@@ -22,8 +27,13 @@ export function Inspector({
   busy,
   lastCommand,
   onAction,
+  onOpenFile,
+  onShowOutput,
   changes,
   sessionStatus,
+  runCheckov,
+  onRunCheckovChange,
+  onCancelOperation,
 }: InspectorProps) {
   const canApply = checks?.plan.ok === true && checks.scan.ok === true
   const isApplied = sessionStatus?.status === 'applied'
@@ -67,30 +77,72 @@ export function Inspector({
       </div>
       <div className="action-block">
         <div className="section-label">Actions</div>
-        <button className="primary-action" disabled={!canApply || Boolean(busy)} onClick={() => onAction('/apply', 'apply')}>
+        {busy && busy !== 'message' && busy !== 'cancelling' && (
+          <button type="button" className="cancel-action" onClick={onCancelOperation}>
+            Cancel operation
+          </button>
+        )}
+        <button className="primary-action" aria-busy={busy === 'apply'} disabled={!canApply || Boolean(busy)} onClick={() => onAction('/apply', 'apply')}>
           {busy === 'apply' ? 'Applying…' : 'Approve & apply'}
           <span>→</span>
         </button>
-        <button className="secondary-action" disabled={Boolean(busy) || !files.length} onClick={() => onAction('/plans/destroy', 'destroy-plan')}>
+        <button className="secondary-action" aria-busy={busy === 'destroy-plan'} disabled={Boolean(busy) || !files.length} onClick={() => onAction('/plans/destroy', 'destroy-plan')}>
           {busy === 'destroy-plan' ? 'Planning…' : 'Preview destroy'}
         </button>
-        <button className="danger-action" disabled={!canDestroy || Boolean(busy)} onClick={() => onAction('/destroy', 'destroy')}>
+        <button className="danger-action" aria-busy={busy === 'destroy'} disabled={!canDestroy || Boolean(busy)} onClick={() => onAction('/destroy', 'destroy')}>
           {busy === 'destroy' ? 'Destroying…' : 'Approve destroy'}
         </button>
-        <p className="action-help">Actions are protected by a file checksum and require a successful security scan.</p>
+        <label className="skip-checkov-toggle">
+          <input
+            type="checkbox"
+            checked={runCheckov}
+            onChange={(event) => onRunCheckovChange(event.target.checked)}
+            disabled={Boolean(busy)}
+          />
+          <span>
+            <strong>Run Checkov security scan</strong>
+            <small>{runCheckov ? 'Recommended — validates security policies' : 'Disabled — faster, less secure'}</small>
+          </span>
+        </label>
+        <p className="action-help">
+          Actions are protected by a file checksum and require Terraform validation and a plan.
+          {!runCheckov && ' Checkov is disabled for the next request.'}
+        </p>
       </div>
       {changes.length > 0 && <ChangesCard changes={changes} />}
+      {lastCommand?.error_analysis && <ErrorAnalysisCard analysis={lastCommand.error_analysis} onShowOutput={onShowOutput} />}
       {lastCommand && <CommandOutput result={lastCommand} />}
       {selectedFile && (
-        <div className="code-preview">
+        <button type="button" className="code-preview" onClick={onOpenFile}>
           <div className="code-title">
             <span>{selectedFile}</span>
             <span>read-only</span>
           </div>
           <pre>{selectedContent}</pre>
-        </div>
+        </button>
       )}
     </aside>
+  )
+}
+
+function ErrorAnalysisCard({
+  analysis,
+  onShowOutput,
+}: {
+  analysis: NonNullable<CommandResponse['error_analysis']>
+  onShowOutput: () => void
+}) {
+  return (
+    <div className="error-analysis-card">
+      <div className="section-label">What happened</div>
+      <strong>{analysis.title}</strong>
+      <p>{analysis.explanation}</p>
+      <div className="error-recommendation">
+        <span>Next step</span>
+        <p>{analysis.recommendation}</p>
+      </div>
+      <button type="button" className="log-button" onClick={onShowOutput}>Open full Terraform output</button>
+    </div>
   )
 }
 
@@ -180,17 +232,26 @@ function formatEstimate(value: number | null | undefined, status: MessageRespons
 }
 
 function CommandOutput({ result }: { result: CommandResponse }) {
+  const running = result.status === 'running'
+  const cancelled = result.status === 'cancelled'
   const noManagedResources = result.status === 'no_managed_resources'
   const isDestroyCommand = isDestroyPlan(result.command)
   const isDestroyExecution = isDestroyCommand && /\bterraform\s+destroy\b/.test(result.command)
   const summary = isDestroyCommand ? normalizeDestroySummary(result.plan_summary ?? parseDestroySummary(result.output)) : null
   return (
-    <div className={`command-output ${noManagedResources ? 'warning' : result.ok ? 'success' : 'failure'}`}>
+    <div className={`command-output ${running ? 'running' : cancelled ? 'warning' : noManagedResources ? 'warning' : result.ok ? 'success' : 'failure'}`}>
       <div>
-        <span className="section-label">{isDestroyExecution ? 'Destroy completed' : isDestroyCommand ? 'Destroy preview' : result.command}</span>
+        <span className="section-label">{running ? 'Terraform operation running' : cancelled ? 'Operation cancelled' : isDestroyExecution ? 'Destroy completed' : isDestroyCommand ? 'Destroy preview' : result.command}</span>
         <StatusDot ok={result.ok} />
       </div>
-      {noManagedResources ? (
+      {running ? (
+        <div className="command-result">
+          <p className="command-message">Terraform is still running. Live output will appear below.</p>
+          <pre>{result.output || 'Waiting for Terraform output.'}</pre>
+        </div>
+      ) : cancelled ? (
+        <p className="command-message">The Terraform operation was cancelled. No further changes are being applied.</p>
+      ) : noManagedResources ? (
         <p className="command-message">No Terraform-managed resources exist in this state. Apply infrastructure before using destroy.</p>
       ) : isDestroyExecution ? (
         <div className="command-result">

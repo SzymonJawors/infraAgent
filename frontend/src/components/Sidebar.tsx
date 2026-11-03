@@ -5,8 +5,10 @@ type SidebarProps = {
   files: WorkspaceFile[]
   selectedFile: string | null
   onSelectFile: (name: string) => void
+  onOpenFile: (name: string) => void
   sessions: SessionSummary[]
   sessionId: string
+  workspaceTitle: string
   onSelectSession: (id: string) => void
   onDeleteSession: (id: string) => void
   onRenameSession: (id: string, title: string) => Promise<void>
@@ -17,8 +19,10 @@ export function Sidebar({
   files,
   selectedFile,
   onSelectFile,
+  onOpenFile,
   sessions,
   sessionId,
+  workspaceTitle,
   onSelectSession,
   onDeleteSession,
   onRenameSession,
@@ -46,7 +50,7 @@ export function Sidebar({
         <div className="workspace-card">
           <div className="workspace-icon">⌁</div>
           <div>
-            <strong>Untitled environment</strong>
+            <strong>{workspaceTitle}</strong>
             <span>Local session</span>
           </div>
           <span className="live-dot" />
@@ -129,7 +133,10 @@ export function Sidebar({
               <button
                 className={`file-item ${selectedFile === file.name ? 'active' : ''}`}
                 key={file.name}
-                onClick={() => onSelectFile(file.name)}
+                onClick={() => {
+                  onSelectFile(file.name)
+                  onOpenFile(file.name)
+                }}
               >
                 <span className="file-icon">TF</span>
                 <span>{file.name}</span>

@@ -5,7 +5,7 @@ import { Inspector } from './components/Inspector'
 import { Sidebar } from './components/Sidebar'
 import { StatusDot } from './components/StatusDot'
 import { cancelMessageWebSocket, createSessionId, getSessionId, request, streamMessageWebSocket } from './lib/api'
-import type { AgentJobStatus, AgentProgress, AgentTiming, ChatMessage, CommandResponse, MessageResponse, OperationRecord, SessionSummary, WorkspaceFile, SessionStatus } from './lib/types'
+import type { AgentJobStatus, AgentProgress, AgentTiming, ChatMessage, CommandResponse, ConversationMessage, MessageResponse, OperationRecord, SessionSummary, WorkspaceFile, SessionStatus } from './lib/types'
 
 function App() {
   const [sessionId] = useState(getSessionId)
@@ -25,6 +25,9 @@ function App() {
   const [progress, setProgress] = useState<AgentProgress[]>([])
   const [timing, setTiming] = useState<AgentTiming[]>([])
   const [operations, setOperations] = useState<OperationRecord[]>([])
+  const [runCheckov, setRunCheckov] = useState(() => localStorage.getItem('infraagent-run-checkov') !== 'false')
+  const [viewer, setViewer] = useState<{ title: string; content: string } | null>(null)
+  const activeSession = sessions.find((session) => session.id === sessionId)
   const [confirmation, setConfirmation] = useState<{
     title: string
     message: string
@@ -36,9 +39,10 @@ function App() {
   const appendAssistantResponse = useCallback((result: MessageResponse) => {
     const marker = `infraagent-job:${sessionId}`
     const responseKey = JSON.stringify(result)
-    if (localStorage.getItem(marker) === responseKey) return false
+    const alreadyShown = localStorage.getItem(marker) === responseKey
     localStorage.setItem(marker, responseKey)
     setChecks(result)
+    if (alreadyShown) return false
     setMessages((current) => [...current, { id: Date.now(), role: 'assistant', text: result.reply }])
     return true
   }, [sessionId])
@@ -78,11 +82,49 @@ function App() {
   const loadOperations = useCallback(async () => {
     const result = await request<{ operations: OperationRecord[] }>(`/sessions/${sessionId}/operations`)
     setOperations(result.operations)
+    const active = result.operations.find((operation) =>
+      operation.status === 'running' && ['apply', 'destroy', 'destroy-plan'].includes(operation.kind),
+    )
+    if (active) {
+      setBusy((current) => current ?? active.kind)
+    }
+  }, [sessionId])
+
+  const waitForOperation = useCallback(async (operationId: number) => {
+    for (;;) {
+      const result = await request<{ operations: OperationRecord[] }>(`/sessions/${sessionId}/operations`)
+      const operation = result.operations.find((item) => item.id === operationId)
+      setOperations(result.operations)
+      if (!operation || operation.status !== 'running') {
+        return request<CommandResponse>(`/sessions/${sessionId}/operations/${operationId}`)
+      }
+      setLastCommand({
+        ok: true,
+        command: operation.command || `terraform ${operation.kind}`,
+        output: operation.output || 'Terraform operation is still running.',
+        status: 'running',
+        operation_id: operationId,
+      })
+      await new Promise((resolve) => window.setTimeout(resolve, 750))
+    }
   }, [sessionId])
 
   useEffect(() => {
     void (async () => {
       try {
+        await request(`/sessions/${sessionId}`, { method: 'POST' })
+        const conversation = await request<{ messages: ConversationMessage[] }>(
+          `/sessions/${sessionId}/conversation`,
+        )
+        setMessages(
+          conversation.messages.length > 0
+            ? conversation.messages.map((item, index) => ({
+                id: index + 1,
+                role: item.role,
+                text: item.content,
+              }))
+            : getWelcomeMessage(),
+        )
         await loadFiles()
         await loadSessions()
       } catch {
@@ -99,27 +141,31 @@ function App() {
         )
       }
     })()
-  }, [loadFiles, loadSessions])
+  }, [loadFiles, loadSessions, sessionId])
 
   useEffect(() => {
     void loadSessionStatus().catch(() => setError('Could not load infrastructure status.'))
   }, [loadSessionStatus])
   useEffect(() => {
     void loadOperations().catch(() => setError('Could not load operation history.'))
+    const timer = window.setInterval(() => {
+      void loadOperations().catch(() => undefined)
+    }, 1000)
+    return () => window.clearInterval(timer)
   }, [loadOperations])
 
   const restoreJob = useCallback(async () => {
     const result = await request<AgentJobStatus>(`/sessions/${sessionId}/agent-status`)
     if (result.status === 'running') {
-      setBusy('message')
-      setProgress(result.progress)
+      setBusy((current) => current && current !== 'message' ? current : 'message')
+      setProgress(result.progress.filter((item) => item.stage !== 'metrics'))
       const metricEvent = result.progress.find((item) => item.stage === 'metrics')
       if (metricEvent) setTiming(parseTiming(metricEvent.message))
       return
     }
     if ((result.status === 'failed' || result.status === 'cancelled') && result.error) {
-      setBusy(null)
-      if (!result.error.toLowerCase().includes('busy')) setError(result.error)
+      setBusy((current) => current === 'message' ? null : current)
+      setError(result.error)
       return
     }
     if (result.status === 'completed' && result.result) {
@@ -130,9 +176,9 @@ function App() {
       }
       const metricEvent = result.progress.find((item) => item.stage === 'metrics')
       if (metricEvent) setTiming(parseTiming(metricEvent.message))
-      setBusy(null)
+      setBusy((current) => current === 'message' ? null : current)
     }
-  }, [appendAssistantResponse, loadFiles, loadSessionStatus, loadSessions])
+  }, [appendAssistantResponse, loadFiles, loadSessionStatus, loadSessions, sessionId])
 
   useEffect(() => {
     void restoreJob().catch(() => setError('Could not load agent status.'))
@@ -145,6 +191,17 @@ function App() {
   useEffect(() => {
     localStorage.setItem(`infraagent-messages:${sessionId}`, JSON.stringify(messages))
   }, [messages, sessionId])
+
+  async function createNewSession() {
+    const nextSession = createSessionId()
+    try {
+      await request(`/sessions/${nextSession}`, { method: 'POST' })
+      localStorage.setItem('infraagent-session', nextSession)
+      window.location.reload()
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not create a new session.')
+    }
+  }
 
   async function sendMessage(event: FormEvent) {
     event.preventDefault()
@@ -161,10 +218,13 @@ function App() {
     try {
       const result = await streamMessageWebSocket(
         sessionId,
-        { message: trimmed },
+        { message: trimmed, skip_checkov: !runCheckov },
         (item) => {
+          if (item.stage === 'metrics') {
+            setTiming(parseTiming(item.message))
+            return
+          }
           setProgress((current) => [...current, item])
-          if (item.stage === 'metrics') setTiming(parseTiming(item.message))
         },
       )
       appendAssistantResponse(result)
@@ -194,30 +254,71 @@ function App() {
     }
   }
 
+  async function cancelOperation() {
+    const operationId = lastCommand?.operation_id
+    if (operationId == null) return
+    try {
+      await request(`/sessions/${sessionId}/operations/${operationId}/cancel`, { method: 'POST' })
+      setLastCommand((current) => current ? {
+        ...current,
+        ok: false,
+        status: 'cancelled',
+        output: 'Terraform operation cancelled.',
+      } : current)
+      setMessages((current) => [
+        ...current,
+        { id: Date.now(), role: 'assistant', text: 'Operation cancelled. No further Terraform changes are being applied.' },
+      ])
+      await loadOperations()
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not cancel Terraform operation.')
+    }
+  }
+
   async function executeAction(path: string, label: string) {
     setBusy(label)
     setError('')
     setLastCommand(null)
     try {
-      const result = await request<CommandResponse>(`/sessions/${sessionId}${path}`, {
+      let result = await request<CommandResponse>(`/sessions/${sessionId}${path}`, {
         method: 'POST',
         body: path.includes('/plans/') ? undefined : JSON.stringify({ approve: true }),
       })
       setLastCommand(result)
-      await loadSessionStatus()
-      await loadOperations()
+      if (result.operation_id != null) {
+        if (result.status === 'running') {
+          result = await waitForOperation(result.operation_id)
+        }
+      }
+      setLastCommand(result)
       if (path === '/destroy') {
         setMessages((current) => [
           ...current,
           {
             id: Date.now(),
-            role: 'assistant',
+            role: result.status === 'cancelled' ? 'assistant' : result.ok ? 'assistant' : 'error',
             text:
-              result.status === 'no_managed_resources'
+              result.status === 'cancelled'
+                ? 'Destroy operation cancelled.'
+                : result.status === 'no_managed_resources'
                 ? 'No managed Terraform resources were found.'
                 : result.ok
                   ? 'Destroy completed successfully. The managed AWS resources have been removed.'
                   : 'The destroy operation failed. Review the command output.',
+          },
+        ])
+      }
+      if (path === '/apply') {
+        setMessages((current) => [
+          ...current,
+          {
+            id: Date.now(),
+            role: result.status === 'cancelled' ? 'assistant' : result.ok ? 'assistant' : 'error',
+            text: result.status === 'cancelled'
+              ? 'Apply operation cancelled. No further Terraform changes are being applied.'
+              : result.ok
+              ? 'Apply completed successfully. The AWS infrastructure is now deployed.'
+              : 'Apply failed. Open the full Terraform output in the Inspector to see the exact error.',
           },
         ])
       }
@@ -228,7 +329,9 @@ function App() {
             id: Date.now(),
             role: 'assistant',
             text:
-              result.status === 'no_managed_resources'
+              result.status === 'cancelled'
+                ? 'Destroy preview cancelled.'
+                : result.status === 'no_managed_resources'
                 ? 'There are no Terraform-managed resources to destroy. Apply the infrastructure first.'
                 : result.ok
                   ? 'The destroy preview is ready. Review the resources in the inspector, then approve the destroy operation.'
@@ -236,9 +339,14 @@ function App() {
           },
         ])
       }
-
+      await Promise.allSettled([loadSessionStatus(), loadOperations()])
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'The Terraform action failed.')
+      const text = requestError instanceof Error ? requestError.message : 'The Terraform action failed.'
+      setError(text)
+      setMessages((current) => [
+        ...current,
+        { id: Date.now(), role: 'error', text: `Terraform operation failed: ${text}` },
+      ])
     } finally {
       setBusy(null)
     }
@@ -319,10 +427,28 @@ function App() {
           <div className="brand-mark">IA</div>
           <div>
             <strong>InfraAgent</strong>
-            <span>Infrastructure workspace</span>
+            <span>
+              Infrastructure workspace · Made by{' '}
+              <a
+                className="author-link"
+                href="https://github.com/SzymonJawors"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Szymon Jaworski
+              </a>
+            </span>
           </div>
         </div>
+        <div className="product-heading">
+          <span className="eyebrow">AI infrastructure assistant</span>
+          <strong>Build with confidence.</strong>
+          <span>Configuration, validation and security review.</span>
+        </div>
         <div className="topbar-meta">
+          <span className="heading-status">
+            <StatusDot ok={Boolean(checks)} warning={!checks} /> {checks ? 'Ready for review' : 'Waiting for request'}
+          </span>
           <span className="connection">
             <StatusDot ok /> API connected
           </span>
@@ -334,12 +460,11 @@ function App() {
             className="new-session-button"
             type="button"
             onClick={() => {
-              const nextSession = createSessionId()
-              localStorage.setItem('infraagent-session', nextSession)
-              window.location.reload()
+              void createNewSession()
             }}
           >
-            New session
+            <span className="new-session-label">New session</span>
+            <span className="new-session-short">New</span>
           </button>
         </div>
       </header>
@@ -348,8 +473,13 @@ function App() {
           files={files}
           selectedFile={selectedFile}
           onSelectFile={setSelectedFile}
+          onOpenFile={(name) => {
+            const file = files.find((item) => item.name === name)
+            if (file) setViewer({ title: file.name, content: file.content })
+          }}
           sessions={sessions}
           sessionId={sessionId}
+          workspaceTitle={activeSession?.title ?? 'Untitled environment'}
           onSelectSession={(id) => {
             localStorage.setItem('infraagent-session', id)
             window.location.reload()
@@ -362,7 +492,6 @@ function App() {
           messages={messages}
           message={message}
           busy={busy}
-          checksReady={Boolean(checks)}
           error={error}
           progress={progress}
           timing={timing}
@@ -378,8 +507,20 @@ function App() {
           busy={busy}
           lastCommand={lastCommand}
           onAction={runAction}
+          onOpenFile={() => {
+            if (selectedFile) setViewer({ title: selectedFile, content: selectedContent })
+          }}
+          onShowOutput={() => {
+            if (lastCommand) setViewer({ title: 'Terraform command output', content: lastCommand.output || 'No command output.' })
+          }}
           changes={checks?.changes ?? []}
           sessionStatus={sessionStatus}
+          runCheckov={runCheckov}
+          onCancelOperation={() => void cancelOperation()}
+          onRunCheckovChange={(value) => {
+            setRunCheckov(value)
+            localStorage.setItem('infraagent-run-checkov', String(value))
+          }}
         />
       </main>
       {confirmation && (
@@ -400,6 +541,20 @@ function App() {
           </section>
         </div>
       )}
+      {viewer && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setViewer(null)
+        }}>
+          <section className="viewer-modal" role="dialog" aria-modal="true" aria-labelledby="viewer-title">
+            <div className="viewer-header">
+              <span className="eyebrow">Read-only viewer</span>
+              <button type="button" className="viewer-close" onClick={() => setViewer(null)} aria-label="Close viewer">×</button>
+            </div>
+            <h2 id="viewer-title">{viewer.title}</h2>
+            <pre>{viewer.content}</pre>
+          </section>
+        </div>
+      )}
     </div>
   )
 }
@@ -416,13 +571,7 @@ function parseTiming(message: string): AgentTiming[] {
 }
 
 function getStoredMessages(sessionId: string): ChatMessage[] {
-  const fallback: ChatMessage[] = [
-    {
-      id: 1,
-      role: 'assistant',
-      text: 'Describe the infrastructure you need. I will generate Terraform, validate it, and show you the plan before deployment.',
-    },
-  ]
+  const fallback = getWelcomeMessage()
   const stored = localStorage.getItem(`infraagent-messages:${sessionId}`)
   if (!stored) return fallback
   try {
@@ -431,6 +580,14 @@ function getStoredMessages(sessionId: string): ChatMessage[] {
   } catch {
     return fallback
   }
+}
+
+function getWelcomeMessage(): ChatMessage[] {
+  return [{
+    id: 1,
+    role: 'assistant',
+    text: 'Describe the infrastructure you need. I will generate Terraform, validate it, and show you the plan before deployment.',
+  }]
 }
 
 export default App

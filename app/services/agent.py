@@ -15,92 +15,56 @@ from app.services.hcl_guard import rejected_hcl
 from app.services.scanner import WorkspaceScanner
 from app.services.approval import files_digest
 from app.services.terraform import CommandResult, TerraformService
-from app.services.workspace_lock import workspace_lease
 from app.services.builder import BuilderAgent
 from app.services.planner import PlannerAgent
 from app.services.reviewer import ReviewAgent, credentials_missing, non_retryable
 from app.services.timing import Timing
+from app.services.workspace_lock import workspace_lease
 
 _SYSTEM_PROMPT = """# Role
+You are InfraAgent, a tool-using AWS Terraform agent. Translate the request into Terraform in the
+current session workspace, validate it, and explain only what actually changed.
 
-You are InfraAgent, a tool-using AWS Terraform agent. Translate the user's infrastructure request
-into Terraform in the current session workspace, validate the result, and explain what actually
-changed. Do not only describe code that could be written.
+# Tools
+- `write_tf(filename, content)` creates or replaces one plain `*.tf` file.
+- `read_workspace()` reads the current Terraform files before a follow-up change.
+- `check_infrastructure()` runs fmt, init, validate, Checkov, and plan when AWS credentials exist.
+  It never applies or destroys infrastructure.
+- Use Terraform Registry tools for provider documentation when available; continue from knowledge
+  if they are unavailable.
 
-# Capabilities
+# Terraform rules
+- Use responsibility-based files (`versions.tf`, `provider.tf`, `network.tf`, `compute.tf`,
+  `database.tf`, `storage.tf`, `outputs.tf`) without duplicates or empty files.
+- Use the confirmed region, `hashicorp/aws ~> 6.0`, and `hashicorp/random ~> 3.0` only when needed.
+  Treat `eu central`, `eu-central`, and `Frankfurt` as `eu-central-1`.
+- Never write credentials, passwords, placeholders, provisioners, `local-exec`, `remote-exec`, or
+  `data "external"`. Use private subnets, encryption, blocked S3 public access, customer-managed
+  KMS keys with least-privilege policies, flow logs and an empty default security group for
+  production VPCs, and PostgreSQL `rds.force_ssl = 1`.
+- Lambda packages require an explicit `hashicorp/archive` declaration in `versions.tf`, a local
+  deterministic source, and Terraform init may download it when registry access is available.
+- RDS Enhanced Monitoring requires its trusted IAM role, the AWS managed monitoring policy, and
+  `monitoring_role_arn`. CloudWatch Logs require a dedicated KMS key allowing the regional Logs
+  service; do not reuse an RDS-only key.
+- RDS subnet groups require two subnets in different AZs. Add a second private subnet and route
+  association when an existing VPC has only one.
+- Never guess `aws_db_instance.engine_version`; omit it unless the exact regional version is
+  confirmed. Do not enable EC2 termination protection by default.
+- Never hardcode AMI IDs. Use an `aws_ami` data source for the requested architecture and Amazon
+  Linux 2023. Do not open `0.0.0.0/0` unless explicitly requested.
+- Do not add replication, access logging, or event notifications only for generic Checkov findings.
+  `CKV_AWS_18`, `CKV_AWS_144`, and `CKV2_AWS_62` are accepted; other actionable findings block.
 
-- **write_tf(filename, content)** — create or replace one plain `*.tf` file in the session.
-- **read_workspace()** — inspect all existing Terraform files before a follow-up change.
-- **check_infrastructure()** — format, initialize, validate, scan with Checkov, and plan when AWS
-  credentials exist. It never applies or destroys infrastructure.
-- **Terraform Registry tools** — use them for resource documentation when available; continue from
-  knowledge if they are unavailable.
-
-# Output constraints
-
-- Use only plain Terraform filenames. For multiple components, organize by responsibility:
-  `versions.tf`, `provider.tf`, `network.tf`, `compute.tf`, `database.tf`, `storage.tf`, and
-  `outputs.tf` as needed. Terraform loads all `.tf` files together; do not duplicate blocks or
-  create empty files.
-- Use the user's confirmed AWS region and constrain `hashicorp/aws` to `~> 6.0`. Use
-  `hashicorp/random ~> 3.0` only when random resources are present. Interpret `eu central`,
-  `eu-central`, and `Frankfurt` as `eu-central-1`.
-- Never write credentials, passwords, placeholders, `local-exec`, `remote-exec`, provisioners, or
-  `data "external"`. Use AWS-managed RDS passwords, private subnets, encryption, and blocked S3
-  public access. Production VPCs require flow logs and an empty default security group. Encrypted
-  resources use customer-managed KMS keys with least-privilege policies; PostgreSQL uses
-  `rds.force_ssl = 1`.
-- When enabling RDS Enhanced Monitoring (`monitoring_interval`), always create an IAM role trusted
-  by `monitoring.rds.amazonaws.com`, attach
-  `service-role/AmazonRDSEnhancedMonitoringRole`, and set `monitoring_role_arn`. CloudWatch Logs
-  log groups must use a dedicated KMS key whose policy permits the regional Logs service; never
-  reuse an RDS-only KMS key for CloudWatch Logs.
-- Do not enable EC2 termination protection by default. Omit `disable_api_termination` or set it to
-  `false`, so an explicitly approved destroy can remove the instance. Only set it to `true` when
-  the user explicitly requests termination protection and explain that destroy requires disabling it.
-- Never hardcode an AMI id such as `ami-...`: AMI ids are region-specific and become stale. For
-  EC2, define `data "aws_ami"` with `owners = ["amazon"]`, `most_recent = true`, filters for
-  `state = "available"`, the requested architecture, and an Amazon Linux 2023 name; set
-  `ami = data.aws_ami.<name>.id`.
-- Do not open `0.0.0.0/0` unless explicitly requested. Do not add S3 replication, access logging,
-  or event notifications only for generic Checkov recommendations. `CKV_AWS_18`, `CKV_AWS_144`,
-  and `CKV2_AWS_62` are accepted findings; other actionable findings are blocking.
-
-# Behavioral guidelines
-
-- Treat each message as a request against the current workspace. Preserve unrelated resources,
-  read existing files, and edit only what the user asks for. A follow-up is an amendment, not a
-  validation-only request.
-- If no region is supplied and no existing provider region is available, ask one question and write
-  nothing. Otherwise act immediately. Never claim a change was made unless a file was written.
-- After writing, call `check_infrastructure`. Fix HCL validation or security failures and check again,
-  up to five attempts. Stop and explain when Terraform, provider downloads, or AWS credentials make
-  a safe check impossible.
-- Never finish with "I can fix this next" while blocking Checkov findings remain. You must edit the
-  Terraform files and call `check_infrastructure` again; only stop after the scan passes or a
-  non-retryable infrastructure error is reported.
-- For `CKV_AWS_394` on `aws_availability_zones`, do not keep selecting
-  `data.aws_availability_zones.*.names[index]`; use explicitly pinned Availability Zone names
-  matching the confirmed region, or another fixed, deterministic list.
-- Reply in the user's latest language. State what changed, the important security choices, and any
-  unresolved error. Chat never applies or destroys infrastructure; those actions require approval.
-
-# Examples
-
-**Example 1 — create**
-User: "Create a private encrypted S3 bucket in eu-central-1."
-Action: write the required provider and storage files, then call `check_infrastructure`.
-Reply: "Created the private encrypted bucket in eu-central-1. Public access is blocked."
-
-**Example 2 — follow-up edit**
-Existing workspace contains `provider.tf` and a private bucket. User: "Enable versioning."
-Action: preserve the provider and security settings, edit the responsible Terraform file, then
-call `check_infrastructure`. Do not regenerate unrelated resources.
-
-**Example 3 — region amendment**
-Existing workspace uses `eu-central-1`. User: "Change the region to us-east-1."
-Action: update the existing AWS provider configuration to `us-east-1`, preserve all other resources,
-and validate the workspace. Do not merely say that the region was changed."""
+# Workflow and response
+- Treat every message as a request against the current workspace. Preserve unrelated resources and
+  make only requested edits. Ask one region question and write nothing when no region is available.
+- After writing, call `check_infrastructure`; fix HCL or security failures and recheck once more.
+  Stop on non-retryable provider, Terraform, credential, or infrastructure errors.
+- For `CKV_AWS_394`, use pinned AZ names matching the confirmed region, not indexed AZ data.
+- Reply in the user's latest language. Chat never applies or destroys; those require approval.
+- Keep the final reply short and current with exactly `Changed`, `Validation`, and `Next step` only
+  when needed. Do not repeat old settings, reports, or optional follow-up offers."""
 
 _MAX_VALIDATE = 2
 class AgentCancelled(Exception):
@@ -137,15 +101,16 @@ class InfraAgent:
         message: str,
         on_progress: Callable[[str, str, str | None], None] | None = None,
         cancel_event: threading.Event | None = None,
+        skip_checkov: bool = False,
     ) -> AgentTurn:
-        with workspace_lease(self.workspace):
-            return self._run_unlocked(message, on_progress, cancel_event)
+        return self._run_unlocked(message, on_progress, cancel_event, skip_checkov)
 
     def _run_unlocked(
         self,
         message: str,
         on_progress: Callable[[str, str, str | None], None] | None = None,
         cancel_event: threading.Event | None = None,
+        skip_checkov: bool = False,
     ) -> AgentTurn:
         progress = on_progress or (lambda _stage, _message, _command=None: None)
         cancel_event = cancel_event or threading.Event()
@@ -168,6 +133,8 @@ class InfraAgent:
             _command_message,
             _MAX_VALIDATE,
             timing,
+            skip_checkov,
+            preflight=lambda: _database_subnet_group_issue(scanner.read()),
         )
 
         def write_tf(filename: str, content: str) -> str:
@@ -195,7 +162,8 @@ class InfraAgent:
                 return "Rejected: file is larger than 200 KB."
             if target.is_file() and target.read_text(encoding="utf-8") == content:
                 return f"{name} is unchanged; reuse the existing infrastructure review."
-            target.write_text(content, encoding="utf-8")
+            with workspace_lease(self.workspace):
+                target.write_text(content, encoding="utf-8")
             return f"Wrote {name}."
 
         def read_workspace() -> str:
@@ -270,15 +238,27 @@ class InfraAgent:
             context.append("The session has no Terraform files yet.")
         history_context = ""
         if conversation:
-            history_context = (
-                "\n\n# Recent conversation history\n"
-                "Use this history to resolve short follow-ups such as a region answer. "
-                "The latest user request still has priority.\n"
-                + "\n".join(
-                    f"{item['role']}: {item['content']}"
-                    for item in conversation[-6:]
+            history_items: list[str] = []
+            for item in conversation[-6:]:
+                role = item.get("role")
+                content = item.get("content", "").strip()
+                if role not in {"user", "assistant"} or not content:
+                    continue
+                if len(content) > 1600:
+                    content = content[:1600].rstrip() + "..."
+                label = "User" if role == "user" else "Assistant"
+                history_items.append(f"{label}: {content}")
+            if history_items:
+                history_context = (
+                    "\n\n# Recent conversation context\n"
+                    "Use this short history to understand follow-ups and prior decisions. "
+                    "The latest request has priority. Existing Terraform files are the source "
+                    "of truth; assistant messages are only context and may be stale. Do not "
+                    "copy previous summaries, validation reports, security checklists, or "
+                    "unchanged settings into the final reply. Report only what changed in "
+                    "this turn and any current unresolved issue.\n\n"
+                    + "\n\n".join(history_items)
                 )
-            )
         user_text = f"{message}\n\n" + "\n\n".join(context) + history_context
         fast_path = _is_fast_request(message, scanner.files())
         if fast_path:
@@ -327,6 +307,7 @@ class InfraAgent:
                     or non_retryable(*review) is not None,
                     model_output=_model_output,
                     timing=timing,
+                    skip_checkov=skip_checkov,
                 )
                 return result, registry_docs
             except RuntimeError as exc:
@@ -343,6 +324,7 @@ class InfraAgent:
                     or non_retryable(*review) is not None,
                     model_output=_model_output,
                     timing=timing,
+                    skip_checkov=skip_checkov,
                 )
                 return result, False
             finally:
@@ -366,16 +348,25 @@ class InfraAgent:
                 or non_retryable(*review) is not None,
                 model_output=_model_output,
                 timing=timing,
+                skip_checkov=skip_checkov,
             )
             registry_docs = False
         else:
             try:
                 result, registry_docs = asyncio.run(invoke_graph())
             except GraphRecursionError:
-                progress("reviewing", "Finishing the review after the iteration limit...", "Terraform and Checkov review")
+                progress(
+                    "reviewing",
+                    "Finishing the review after the iteration limit...",
+                    "Terraform review" if skip_checkov else "Terraform and Checkov review",
+                )
                 result = {"messages": []}
                 registry_docs = False
-        progress("reviewing", "Reviewing the generated infrastructure...", "Terraform and Checkov review")
+        progress(
+            "reviewing",
+            "Reviewing the generated infrastructure...",
+            "Terraform review" if skip_checkov else "Terraform and Checkov review",
+        )
         if scanner.files() and reviewer.current() is not None and reviewer.state.digest == files_digest(self.workspace):
             validation, plan, scan = reviewer.current()
         elif scanner.files():
@@ -411,8 +402,7 @@ class InfraAgent:
                 "maximum reasoning steps before completing all security fixes. "
                 "The current Terraform remains available for review; no changes were applied."
             )
-        if not registry_docs:
-            reply = reply.strip()
+        reply = _finalize_reply(reply)
         _write_conversation(
             conversation_path,
             [*conversation, {"role": "user", "content": message}, {"role": "assistant", "content": reply}],
@@ -471,6 +461,36 @@ def _command_message(command: str) -> str:
     return "Running an infrastructure command..."
 
 
+def _database_subnet_group_issue(terraform: str) -> str | None:
+    """Catch the AWS RDS two-AZ requirement before approval/apply."""
+    if re.search(
+        r'resource\s+"aws_db_instance"\s+"[^"]+"\s*\{(?:(?!\n\}).)*?^\s*engine_version\s*=',
+        terraform,
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    ):
+        return (
+            "RDS engine_version is hardcoded to a possibly unavailable version. "
+            "Remove engine_version or replace it only with a version confirmed "
+            "available in the selected region and instance configuration."
+        )
+    for block in re.finditer(
+        r'resource\s+"aws_db_subnet_group"\s+"[^"]+"\s*\{(.*?)\n\}',
+        terraform,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        subnet_ids = re.search(r"subnet_ids\s*=\s*\[(.*?)\]", block.group(1), re.IGNORECASE | re.DOTALL)
+        if not subnet_ids:
+            continue
+        references = re.findall(r"aws_subnet\.[A-Za-z0-9_]+\.id", subnet_ids.group(1))
+        if len(references) == 1:
+            return (
+                "RDS DB subnet groups must include subnets in at least two Availability Zones. "
+                f"Only {references[0]} is configured. Add a second private subnet in a "
+                "different AZ and include both subnet IDs in subnet_ids before planning."
+            )
+    return None
+
+
 def _should_use_registry_tools(message: str, existing: str) -> bool:
     """Use MCP only when the user explicitly needs registry documentation."""
     normalized = message.lower()
@@ -493,6 +513,9 @@ def _is_fast_request(message: str, files: list[str]) -> bool:
         return False
     normalized = message.lower()
     resource_terms = (
+        "server",
+        "ec2",
+        "instance",
         "bucket",
         "s3",
         "database",
@@ -516,6 +539,22 @@ def _last_reply(messages: list) -> str:
         if text and message.__class__.__name__ in {"AIMessage", "AIMessageChunk"}:
             return text
     return ""
+
+
+_OPTIONAL_FOLLOW_UP = re.compile(
+    r"(?im)^(?:[-*]\s*)?(?:if you want|if you would like|jeśli chcesz|jesli chcesz|"
+    r"jeżeli chcesz|jezeli chcesz|mogę jeszcze|moge jeszcze|mogę też|moge tez)\b"
+)
+
+
+def _finalize_reply(reply: str) -> str:
+    """Keep agent replies focused on the completed result and required action."""
+    paragraphs = re.split(r"\n\s*\n", reply.strip())
+    for index, paragraph in enumerate(paragraphs):
+        if _OPTIONAL_FOLLOW_UP.search(paragraph):
+            paragraphs = paragraphs[:index]
+            break
+    return "\n\n".join(paragraphs).strip() or reply.strip()
 
 
 def _as_text(content: object) -> str:

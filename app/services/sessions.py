@@ -57,9 +57,21 @@ def _connect() -> sqlite3.Connection:
             started_at TEXT NOT NULL,
             finished_at TEXT,
             summary TEXT NOT NULL DEFAULT ''
+            ,command TEXT NOT NULL DEFAULT ''
+            ,output TEXT NOT NULL DEFAULT ''
+            ,ok INTEGER
         )
         """
     )
+    for column, definition in (
+        ("command", "TEXT NOT NULL DEFAULT ''"),
+        ("output", "TEXT NOT NULL DEFAULT ''"),
+        ("ok", "INTEGER"),
+    ):
+        try:
+            connection.execute(f"ALTER TABLE operations ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
     return connection
 
 
@@ -74,16 +86,53 @@ def start_operation(session_id: str, kind: str) -> int:
         return int(cursor.lastrowid)
 
 
-def finish_operation(session_id: str, operation_id: int, status: str, summary: str = "") -> None:
+def finish_operation(
+    session_id: str,
+    operation_id: int,
+    status: str,
+    summary: str = "",
+    *,
+    command: str = "",
+    output: str = "",
+    ok: bool | None = None,
+) -> None:
     require_session_id(session_id)
     with _connect() as connection:
         connection.execute(
             """
             UPDATE operations
-            SET status = ?, finished_at = ?, summary = ?
+            SET status = ?, finished_at = ?, summary = ?, command = ?, output = ?, ok = ?
             WHERE id = ? AND session_id = ?
             """,
-            (status, datetime.now(UTC).isoformat(), summary[:500], operation_id, session_id),
+            (
+                status,
+                datetime.now(UTC).isoformat(),
+                summary[:500],
+                command,
+                output,
+                None if ok is None else int(ok),
+                operation_id,
+                session_id,
+            ),
+        )
+
+
+def update_operation_output(
+    session_id: str,
+    operation_id: int,
+    output: str,
+    *,
+    command: str = "",
+) -> None:
+    require_session_id(session_id)
+    with _connect() as connection:
+        connection.execute(
+            """
+            UPDATE operations
+            SET output = ?, command = COALESCE(NULLIF(?, ''), command)
+            WHERE id = ? AND session_id = ?
+            """,
+            (output, command, operation_id, session_id),
         )
 
 
@@ -92,7 +141,7 @@ def list_operations(session_id: str, limit: int = 30) -> list[dict[str, object]]
     with _connect() as connection:
         rows = connection.execute(
             """
-            SELECT id, kind, status, started_at, finished_at, summary
+            SELECT id, kind, status, started_at, finished_at, summary, command, output, ok
             FROM operations
             WHERE session_id = ?
             ORDER BY id DESC
@@ -108,9 +157,38 @@ def list_operations(session_id: str, limit: int = 30) -> list[dict[str, object]]
             "started_at": row[3],
             "finished_at": row[4],
             "summary": row[5],
+            "command": row[6],
+            "output": row[7],
+            "ok": None if row[8] is None else bool(row[8]),
         }
         for row in rows
     ]
+
+
+def get_operation(session_id: str, operation_id: int) -> dict[str, object] | None:
+    require_session_id(session_id)
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id, kind, status, started_at, finished_at, summary, command, output, ok
+            FROM operations
+            WHERE id = ? AND session_id = ?
+            """,
+            (operation_id, session_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "kind": row[1],
+        "status": row[2],
+        "started_at": row[3],
+        "finished_at": row[4],
+        "summary": row[5],
+        "command": row[6],
+        "output": row[7],
+        "ok": None if row[8] is None else bool(row[8]),
+    }
 
 
 def touch_session(session_id: str, title: str | None = None) -> None:

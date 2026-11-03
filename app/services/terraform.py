@@ -27,11 +27,14 @@ class CommandResult:
     missing_binary: bool = False
     policy_warnings: list[str] = field(default_factory=list)
 
-    def output(self) -> str:
+    def full_output(self) -> str:
         chunks = [part.strip() for part in (self.stdout, self.stderr) if part.strip()]
-        text = "\n".join(chunks)
-        if len(text) > 8000:
-            return text[:8000] + "\n...[truncated]"
+        return "\n".join(chunks)
+
+    def output(self, limit: int = 8000) -> str:
+        text = self.full_output()
+        if len(text) > limit:
+            return text[:limit] + "\n...[truncated]"
         return text
 
 
@@ -59,12 +62,22 @@ class TerraformService:
         settings: Settings,
         timeout: float = 120,
         timing: Timing | None = None,
+        on_output: Callable[[str, str], None] | None = None,
     ) -> None:
         self.workspace = workspace
         self.settings = settings
         self.timeout = timeout
         self.timing = timing or Timing()
         self._initialized_signature: str | None = None
+        self.on_output = on_output
+        self._process: subprocess.Popen[str] | None = None
+        self._process_lock = threading.Lock()
+
+    def cancel(self) -> None:
+        with self._process_lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
 
     def _provider_signature(self) -> str:
         digest = hashlib.sha256()
@@ -302,6 +315,7 @@ class TerraformService:
             f'    path    = "{PLUGIN_CACHE_DIR.as_posix()}"\n'
             '    include = ["registry.terraform.io/hashicorp/*"]\n'
             "  }\n"
+            "  direct {}\n"
             "}\n"
         )
         if not CLI_CONFIG_PATH.is_file() or CLI_CONFIG_PATH.read_text(encoding="utf-8") != cli_config:
@@ -324,15 +338,29 @@ class TerraformService:
         metric = "_".join(part for part in args if part.startswith("-") is False)
         try:
             with self.timing.measure(metric):
-                completed = subprocess.run(
+                process = subprocess.Popen(
                     args,
                     cwd=self.workspace,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
-                    timeout=limit,
                     env=self._env(),
-                    check=False,
                 )
+                with self._process_lock:
+                    self._process = process
+                lines: list[str] = []
+                try:
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        text_line = line.rstrip("\r\n")
+                        lines.append(text_line)
+                        if self.on_output:
+                            self.on_output(text_line, command)
+                    process.wait(timeout=limit)
+                finally:
+                    with self._process_lock:
+                        self._process = None
+                completed_returncode = process.returncode
         except FileNotFoundError:
             return CommandResult(
                 ok=False,
@@ -343,23 +371,22 @@ class TerraformService:
                 missing_binary=True,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            if isinstance(stdout, bytes):
-                stdout = stdout.decode("utf-8", errors="replace")
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode("utf-8", errors="replace")
+            with self._process_lock:
+                process = self._process
+            if process is not None and process.poll() is None:
+                process.terminate()
             return CommandResult(
                 ok=False,
                 command=command,
-                stdout=stdout,
-                stderr=stderr or f"timed out after {limit}s",
+                stdout="\n".join(lines),
+                stderr=f"timed out after {limit}s",
                 returncode=None,
             )
+        stdout = "\n".join(lines)
         return CommandResult(
-            ok=completed.returncode == 0,
+            ok=completed_returncode == 0,
             command=command,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            returncode=completed.returncode,
+            stdout=stdout,
+            stderr="",
+            returncode=completed_returncode,
         )

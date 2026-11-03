@@ -18,3 +18,12 @@ class HclGuardTests(unittest.TestCase):
                 '}'
             )
         )
+
+    def test_rejects_unverified_rds_engine_version(self) -> None:
+        reason = rejected_hcl(
+            'resource "aws_db_instance" "postgres" {\n'
+            '  engine = "postgres"\n'
+            '  engine_version = "16.3"\n'
+            '}\n'
+        )
+        self.assertIn("do not hardcode", reason or "")

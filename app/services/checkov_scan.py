@@ -119,6 +119,11 @@ def _text(value: str | bytes | None) -> str:
 
 
 _ACCEPTED_POLICY_FINDINGS = {
+    "CKV_AWS_382": (
+        "A minimal EC2 workspace allows outbound traffic so the instance can reach "
+        "SSM, package repositories, and AWS APIs. Restricting this requires VPC "
+        "endpoints or a NAT design that was not requested."
+    ),
     "CKV_AWS_18": (
         "S3 access logging is optional here; enabling it requires a separate "
         "logging bucket and adds storage and management cost."
@@ -139,9 +144,9 @@ _ACCEPTED_POLICY_FINDINGS = {
 
 
 def _accepted_findings(output: str) -> set[str]:
-    return set(re.findall(r"CKV(?:2_)?AWS_\d+", output)) & set(_ACCEPTED_POLICY_FINDINGS)
+    return set(re.findall(r"CKV(?:2_)?_AWS_\d+", output)) & set(_ACCEPTED_POLICY_FINDINGS)
 
 
 def _only_accepted_findings(output: str) -> bool:
-    findings = set(re.findall(r"CKV(?:2_)?AWS_\d+", output))
+    findings = set(re.findall(r"CKV(?:2_)?_AWS_\d+", output))
     return bool(findings) and findings <= set(_ACCEPTED_POLICY_FINDINGS)

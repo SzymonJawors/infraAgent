@@ -1,13 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { AgentProgress, AgentTiming, ChatMessage } from '../lib/types'
-import { StatusDot } from './StatusDot'
 
 type ChatPanelProps = {
   messages: ChatMessage[]
   message: string
   busy: string | null
-  checksReady: boolean
   error: string
   progress: AgentProgress[]
   timing: AgentTiming[]
@@ -20,7 +18,6 @@ export function ChatPanel({
   messages,
   message,
   busy,
-  checksReady,
   error,
   progress,
   timing,
@@ -37,16 +34,6 @@ export function ChatPanel({
 
   return (
     <section className="chat-panel">
-      <div className="panel-heading">
-        <div>
-          <span className="eyebrow">AI infrastructure assistant</span>
-          <h1>Build with confidence.</h1>
-          <p>Describe what you need. We handle the configuration, validation and security review.</p>
-        </div>
-        <div className="heading-status">
-          <StatusDot ok={checksReady} warning={!checksReady} /> {checksReady ? 'Ready for review' : 'Waiting for request'}
-        </div>
-      </div>
       <div className="chat-feed">
         {messages.map((item) => (
           <div className={`message-row ${item.role}`} key={item.id}>

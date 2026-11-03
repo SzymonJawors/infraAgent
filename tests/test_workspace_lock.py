@@ -1,3 +1,4 @@
+import os
 import threading
 import unittest
 from pathlib import Path
@@ -22,6 +23,15 @@ class WorkspaceLockTests(unittest.TestCase):
                 with workspace_lease(workspace):
                     self.assertTrue(workspace_is_busy(workspace))
 
+    @unittest.skipUnless(os.name == "nt", "Windows-specific lock file regression")
+    def test_windows_lock_file_has_a_byte_to_lock(self) -> None:
+        with TemporaryDirectory() as root:
+            workspace = Path(root)
+            with workspace_lease(workspace):
+                lock_file = workspace / ".infraagent" / "workspace.lock"
+                self.assertTrue(lock_file.exists())
+
+    @unittest.skipUnless(os.name != "nt", "Windows agent tools may use multiple worker threads")
     def test_competing_thread_is_rejected(self) -> None:
         with TemporaryDirectory() as root:
             workspace = Path(root)

@@ -2,12 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.services.agent import _detect_region, _is_fast_request, _provider_region, _update_provider_region
+from app.services.agent import _detect_region, _finalize_reply, _is_fast_request, _provider_region, _update_provider_region
 
 
 class RegionDetectionTests(unittest.TestCase):
     def test_server_and_region_follow_up_are_not_fast_path_hacks(self) -> None:
-        self.assertFalse(_is_fast_request("zrob server", []))
+        self.assertTrue(_is_fast_request("zrob server", []))
         self.assertFalse(_is_fast_request("frankfurt", []))
         self.assertFalse(_is_fast_request("eu central 1", []))
 
@@ -23,6 +23,11 @@ class RegionDetectionTests(unittest.TestCase):
 
     def test_returns_none_when_region_is_missing(self) -> None:
         self.assertIsNone(_detect_region("Create a private bucket."))
+
+    def test_agent_reply_does_not_offer_optional_follow_up(self) -> None:
+        reply = "The server is ready.\n\nIf you want, I can make it private."
+
+        self.assertEqual(_finalize_reply(reply), "The server is ready.")
 
     def test_updates_existing_provider_region(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

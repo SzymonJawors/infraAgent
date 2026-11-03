@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 from pathlib import Path
 
 
@@ -18,8 +19,17 @@ class WorkspaceLease:
         self._owner_key = (threading.get_ident(), self.workspace)
 
     def acquire(self) -> "WorkspaceLease":
-        if not self._thread_lock.acquire(blocking=False):
-            raise WorkspaceBusyError("workspace is busy")
+        deadline = time.monotonic() + 2.0
+        if os.name == "nt":
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            self._file = self.lock_path.open("a+b")
+            _active_counts[self.workspace] = _active_counts.get(self.workspace, 0) + 1
+            _active_workspaces.add(self.workspace)
+            return self
+        while not self._thread_lock.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                raise WorkspaceBusyError("workspace is busy")
+            time.sleep(0.05)
         depth = _depths.get(self._owner_key, 0)
         _depths[self._owner_key] = depth + 1
         if depth:
@@ -27,7 +37,15 @@ class WorkspaceLease:
         try:
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             self._file = self.lock_path.open("a+b")
-            _lock_file(self._file)
+            while True:
+                try:
+                    _lock_file(self._file)
+                    break
+                except (OSError, BlockingIOError):
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            _active_workspaces.add(self.workspace)
         except (OSError, BlockingIOError):
             if self._file is not None:
                 self._file.close()
@@ -38,6 +56,15 @@ class WorkspaceLease:
         return self
 
     def release(self) -> None:
+        if os.name == "nt":
+            if self._file is not None:
+                _active_counts[self.workspace] -= 1
+                if _active_counts[self.workspace] <= 0:
+                    _active_counts.pop(self.workspace, None)
+                    _active_workspaces.discard(self.workspace)
+                self._file.close()
+                self._file = None
+            return
         depth = _depths.get(self._owner_key, 0)
         if depth <= 1:
             _depths.pop(self._owner_key, None)
@@ -45,8 +72,10 @@ class WorkspaceLease:
             _depths[self._owner_key] = depth - 1
         if self._file is not None:
             try:
-                _unlock_file(self._file)
+                if os.name != "nt":
+                    _unlock_file(self._file)
             finally:
+                _active_workspaces.discard(self.workspace)
                 self._file.close()
                 self._file = None
         self._thread_lock.release()
@@ -63,7 +92,10 @@ def workspace_lease(workspace: Path) -> WorkspaceLease:
 
 
 def workspace_is_busy(workspace: Path) -> bool:
-    path = workspace.resolve() / ".infraagent" / "workspace.lock"
+    workspace = workspace.resolve()
+    if os.name == "nt":
+        return workspace in _active_workspaces
+    path = workspace / ".infraagent" / "workspace.lock"
     if not path.is_file():
         return False
     try:
@@ -77,6 +109,8 @@ def workspace_is_busy(workspace: Path) -> bool:
 
 _LOCKS: dict[Path, threading.RLock] = {}
 _depths: dict[tuple[int, Path], int] = {}
+_active_workspaces: set[Path] = set()
+_active_counts: dict[Path, int] = {}
 _LOCKS_GUARD = threading.Lock()
 
 

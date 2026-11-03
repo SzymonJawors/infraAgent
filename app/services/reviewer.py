@@ -25,6 +25,8 @@ class ReviewAgent:
         command_message: Callable[[str], str],
         max_attempts: int = 5,
         timing: Timing | None = None,
+        skip_checkov: bool = False,
+        preflight: Callable[[], str | None] | None = None,
     ) -> None:
         self.workspace = workspace
         self.terraform = terraform
@@ -33,6 +35,8 @@ class ReviewAgent:
         self.command_message = command_message
         self.max_attempts = max_attempts
         self.timing = timing or Timing()
+        self.skip_checkov = skip_checkov
+        self.preflight = preflight
         self.attempts = 0
         self.exhausted = False
         self.state = ReviewState()
@@ -50,6 +54,15 @@ class ReviewAgent:
             self.state.digest = current_digest
             return message
 
+        preflight_results = self._preflight_results()
+        if preflight_results:
+            validation, plan, scan, preflight_error = preflight_results
+            results = (validation, plan, scan)
+            message = f"configuration error, fix the infrastructure and check again\n{preflight_error}"
+            self.cache[current_digest] = (results, message)
+            self.state = ReviewState(results=results, digest=current_digest)
+            return message
+
         self.attempts += 1
         if self.attempts > self.max_attempts:
             self.exhausted = True
@@ -63,15 +76,7 @@ class ReviewAgent:
                     command,
                 )
             )
-        self.progress(
-            "scanning",
-            "Running security scan...",
-            "checkov -d <workspace> --framework terraform",
-        )
-        with self.timing.measure("checkov"):
-            scan = self.checkov.scan() if validation.ok else skipped_scan(
-                "Skipped because validation did not pass."
-            )
+        scan = self._scan(validation)
         results = (validation, plan, scan)
         body = (
             f"validation {'ok' if validation.ok else 'failed'}\n{model_output(validation.output())}\n"
@@ -99,30 +104,76 @@ class ReviewAgent:
         ensure_active()
         if self.state.results is not None and self.state.digest == files_digest(self.workspace):
             return self.state.results
+        preflight_results = self._preflight_results()
+        if preflight_results:
+            validation, plan, scan, _ = preflight_results
+            self.state = ReviewState(
+                results=(validation, plan, scan),
+                digest=files_digest(self.workspace),
+            )
+            return self.state.results
         with self.timing.measure("terraform_review"):
             validation, plan = self.terraform.review(
                 on_command=lambda command: self.progress(
                     "executing", self.command_message(command), command
                 )
             )
-        with self.timing.measure("checkov"):
-            scan = self.checkov.scan() if validation.ok else skipped_scan(
-                "Skipped because validation did not pass."
-            )
+        scan = self._scan(validation)
         self.state = ReviewState(
             results=(validation, plan, scan),
             digest=files_digest(self.workspace),
         )
         return self.state.results
 
+    def _preflight_results(self):
+        preflight_error = self.preflight() if self.preflight else None
+        if not preflight_error:
+            return None
+        validation = CommandResult(
+            ok=False,
+            command="infrastructure preflight",
+            stdout="",
+            stderr=preflight_error,
+            returncode=1,
+        )
+        plan = CommandResult(
+            ok=False,
+            command="terraform plan",
+            stdout="",
+            stderr="Skipped until the infrastructure preflight passes.",
+            returncode=None,
+        )
+        scan = CommandResult(
+            ok=False,
+            command="infrastructure preflight",
+            stdout="",
+            stderr=preflight_error,
+            returncode=1,
+        )
+        return validation, plan, scan, preflight_error
+
+    def _scan(self, validation: CommandResult) -> CommandResult:
+        if self.skip_checkov:
+            return skipped_scan("Skipped by user for this request.")
+        self.progress(
+            "scanning",
+            "Running security scan...",
+            "checkov -d <workspace> --framework terraform",
+        )
+        with self.timing.measure("checkov"):
+            return self.checkov.scan() if validation.ok else skipped_scan(
+                "Skipped because validation did not pass."
+            )
+
 
 def skipped_scan(reason: str) -> CommandResult:
     return CommandResult(
-        ok=False,
+        ok=True,
         command="checkov",
         stdout="",
         stderr=reason,
         returncode=None,
+        policy_warnings=["checkov_skipped"],
     )
 
 

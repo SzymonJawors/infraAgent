@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 
 class MessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
+    skip_checkov: bool = False
 
 
 class ValidationBody(BaseModel):
@@ -54,6 +55,9 @@ class OperationRecord(BaseModel):
     started_at: str
     finished_at: str | None = None
     summary: str = ""
+    command: str = ""
+    output: str = ""
+    ok: bool | None = None
 
 
 class OperationHistory(BaseModel):
@@ -64,12 +68,22 @@ class ApprovalRequest(BaseModel):
     approve: bool
 
 
+class ErrorAnalysisBody(BaseModel):
+    category: str
+    title: str
+    explanation: str
+    recommendation: str
+    resource: str | None = None
+
+
 class CommandBody(BaseModel):
     ok: bool
     command: str
     output: str
     status: str = "completed"
+    operation_id: int | None = None
     plan_summary: PlanSummary | None = None
+    error_analysis: ErrorAnalysisBody | None = None
 
 
 class FileBody(BaseModel):
@@ -96,6 +110,15 @@ class SessionSummary(BaseModel):
 
 class SessionsResponse(BaseModel):
     sessions: list[SessionSummary]
+
+
+class ConversationMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ConversationResponse(BaseModel):
+    messages: list[ConversationMessage] = Field(default_factory=list)
 
 
 class RenameSessionRequest(BaseModel):

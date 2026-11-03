@@ -11,7 +11,9 @@ InfraAgent zamienia polecenie w języku naturalnym na konfigurację Terraform dl
 ### Zakres
 
 - `GET /health` zwraca `{"status":"ok"}`, gdy proces działa.
-- `POST /sessions/{session_id}/messages` przyjmuje `{"message": "..."}` i zapisuje pliki `.tf` w `workspace/{session_id}/`.
+- `POST /sessions/{session_id}` tworzy pustą sesję przed jej użyciem lub zmianą
+  nazwy. Tytuł sesji jest niezależny od treści wiadomości czatu.
+- `POST /sessions/{session_id}/messages` przyjmuje `{"message": "..."}` i zapisuje pliki `.tf` w `workspace/{session_id}/`. Opcjonalne `skip_checkov: true` pomija skan Checkov tylko dla tego żądania i jest przeznaczone wyłącznie do szybkiego podglądu.
 - `POST /sessions/{session_id}/messages/stream` wysyła postęp generowania przez
   Server-Sent Events (`status`, `result`, `error`); zwykły endpoint pozostaje
   dostępny dla klientów bez obsługi streamingu.
@@ -22,12 +24,16 @@ InfraAgent zamienia polecenie w języku naturalnym na konfigurację Terraform dl
   usuwania istniejących plików Terraform.
 - `GET /sessions/{session_id}/operations` pokazuje historię generowania, planów,
   apply i destroy dla sesji.
+- `GET /sessions/{session_id}/conversation` zwraca trwale zapisaną historię
+  rozmowy z workspace'u sesji; frontend używa jej jako źródła prawdy po
+  ponownym otwarciu sesji.
 - Frontend używa WebSocket do natychmiastowego postępu; SSE pozostaje dostępne
   jako fallback.
 - MCP jest pomijany przy prostych zmianach istniejącego workspace'u i używany
   dla nowych konfiguracji oraz próśb o dokumentację providera.
 - Dokumentacja rejestru korzysta z Terraform MCP przez Streamable HTTP. Backend automatycznie uruchamia lokalną binarkę MCP na `http://127.0.0.1:8080/mcp`; `TERRAFORM_MCP_URL` pozwala wskazać własny działający serwer.
-- Po zapisie plików agent uruchamia `terraform fmt`, `terraform init -backend=false` i `terraform validate`, a potem skan Checkov. Przy obecnych poświadczeniach AWS uruchamia następnie `terraform plan`.
+- Po zapisie plików agent uruchamia `terraform fmt`, `terraform init -backend=false` i `terraform validate`, a potem skan Checkov. Przy obecnych poświadczeniach AWS uruchamia następnie `terraform plan`. Przy `skip_checkov: true` pomija Checkov i dodatkowe próby naprawy, ale nadal wykonuje walidację Terraform oraz plan.
+- Dla RDS agent nie zgaduje `engine_version`, ponieważ dostępne wersje zależą od regionu i klasy instancji. Jeśli wersja nie została potwierdzona, pole jest pomijane.
 - Dla złożonych żądań orchestrator rozdziela pracę na Planner Agent (analiza
   kontekstu), Builder Agent (jedyny agent zapisujący Terraform) oraz
   deterministyczne etapy Validator/Security. Planner i dokumentacja MCP mogą
@@ -41,11 +47,11 @@ InfraAgent zamienia polecenie w języku naturalnym na konfigurację Terraform dl
 - Każde żądanie mierzy czas Plannera, Buildera, review, Checkov oraz
   pojedynczych komend Terraform. Czasy są zapisywane w logu `agent_timing` i
   wysyłane do klienta jako końcowy event `metrics`.
-- Provider Terraform jest przechowywany we wspólnym `.terraform-plugin-cache/`
-  w katalogu projektu jako lokalny filesystem mirror. `terraform init` nie
-  pobiera providerów z internetu ani nie wykonuje automatycznego upgrade'u;
-  używa wyłącznie wersji obecnych w tym katalogu. Brakujący provider kończy
-  init błędem zamiast uruchamiać pobieranie w tle.
+- Provider Terraform jest najpierw szukany we wspólnym `.terraform-plugin-cache/`
+  w katalogu projektu jako lokalny filesystem mirror. `terraform init` nie wykonuje
+  automatycznego upgrade'u. Jeśli providera nie ma w cache, konfiguracja ma fallback
+  `direct {}` i Terraform może pobrać go z registry; bez dostępu do registry init
+  kończy się czytelnym błędem.
 - Błąd konfiguracji z `validate`, skanu albo `plan` jest poprawiany w wygenerowanym HCL i sprawdzany ponownie najwyżej jeden raz (maksymalnie dwa pełne review na żądanie). Agent zatrzymuje się także, gdy pliki nie zmieniły się po poprawce. Nie ogłasza utworzenia infrastruktury, jeśli końcowy review nie przeszedł. Brak CLI, timeout pobierania providera i brak poświadczeń AWS kończą pętlę poprawek. Skan niczego nie wdraża.
 - `local-exec`, `remote-exec`, provisionery oraz `data "external"` są odrzucane przed zapisem.
 - Kolejna wiadomość w tej samej sesji odczytuje pliki już zapisane dla tej sesji i kasuje poprzednie potwierdzenia planu.
@@ -73,7 +79,7 @@ InfraAgent zamienia polecenie w języku naturalnym na konfigurację Terraform dl
 
 ### Zatwierdzenie
 
-Po udanym `terraform plan` i udanym skanie Checkov API zapisuje skrót plików `*.tf`. Nowa wiadomość ten skrót unieważnia. Nieudany skan nie tworzy potwierdzenia i nie uruchamia `apply`.
+Po udanym `terraform plan` i udanym skanie Checkov API zapisuje skrót plików `*.tf`. Przy świadomym `skip_checkov: true` skan jest pomijany, ale skrót nadal może zostać zapisany. Nowa wiadomość ten skrót unieważnia. Nieudana walidacja lub plan nie tworzą potwierdzenia i nie uruchamiają `apply`.
 
 - `POST /sessions/{session_id}/apply` z `{"approve": true}` uruchamia `terraform apply`, gdy skrót planu apply nadal pasuje do plików.
 - `POST /sessions/{session_id}/plans/destroy` uruchamia `terraform plan -destroy` i niczego nie kasuje. Przy sukcesie zapisuje osobny skrót.
@@ -122,6 +128,11 @@ Sprawdź jego stan przez `http://127.0.0.1:8002/health` — odpowiedź zawiera p
 Jeśli używasz własnego serwera MCP, ustaw `TERRAFORM_MCP_URL`.
 
 Poświadczenia AWS są wymagane dla `terraform plan`, `apply` i `destroy`. Sama walidacja działa bez nich.
+
+Terraform korzysta najpierw ze współdzielonego cache providerów, a następnie z bezpośredniego
+Terraform Registry. Dzięki temu zasoby wymagające dodatkowego providera, np. `archive_file` z
+`hashicorp/archive` dla Lambdy, nie kończą się błędem tylko dlatego, że provider nie był wcześniej
+pobrany do cache. Dostęp do `registry.terraform.io` nadal musi być możliwy przy pierwszym użyciu.
 
 ### Instalacja
 
@@ -178,7 +189,7 @@ InfraAgent turns a natural-language infrastructure request into Terraform for AW
 ## Capabilities
 
 - `GET /health` returns `{"status":"ok"}` when the process is running.
-- `POST /sessions/{session_id}/messages` accepts `{"message": "..."}` and writes `.tf` files under `workspace/{session_id}/`.
+- `POST /sessions/{session_id}/messages` accepts `{"message": "..."}` and writes `.tf` files under `workspace/{session_id}/`. Optional `skip_checkov: true` skips Checkov for that request only and is intended only for a quick preview.
 - `POST /sessions/{session_id}/messages/stream` returns Server-Sent Events
   for progress (`status`), the final response (`result`), or a safe error
   (`error`). The regular endpoint remains available for non-streaming clients.
@@ -189,12 +200,17 @@ InfraAgent turns a natural-language infrastructure request into Terraform for AW
   deleting existing Terraform files.
 - `GET /sessions/{session_id}/operations` returns generation, plan, apply, and
   destroy history for the session.
+- `GET /sessions/{session_id}/conversation` returns the persisted conversation
+  history from the session workspace. The frontend uses it as the source of
+  truth when reopening a session and falls back to local storage only when the
+  API is unavailable.
 - The frontend uses WebSocket for immediate progress; SSE remains available as a
   fallback.
 - MCP is skipped for simple edits to an existing workspace and used for new
   configurations or provider documentation requests.
 - Registry documentation uses Terraform MCP over Streamable HTTP. The backend automatically starts the bundled MCP binary at `http://127.0.0.1:8080/mcp`; `TERRAFORM_MCP_URL` can point to an existing service.
-- After the files are written, the agent runs `terraform fmt`, `terraform init -backend=false`, and `terraform validate`, then a Checkov scan. With AWS credentials present, it then runs `terraform plan`.
+- After the files are written, the agent runs `terraform fmt`, `terraform init -backend=false`, and `terraform validate`, then a Checkov scan. With AWS credentials present, it then runs `terraform plan`. With `skip_checkov: true`, Checkov and its extra repair attempts are skipped while Terraform validation and the plan still run.
+- For RDS, the agent does not guess `engine_version` because available versions depend on region and instance class. It omits the field unless the version was confirmed.
 - For complex requests, the orchestrator separates a Planner Agent (context
   analysis), a Builder Agent (the only agent allowed to write Terraform), and
   deterministic Validator/Security stages. Planner analysis and MCP
@@ -206,11 +222,10 @@ InfraAgent turns a natural-language infrastructure request into Terraform for AW
 - Each workspace has a non-blocking file lease at
   `.infraagent/workspace.lock`. It covers generation, validation, plan, apply,
   and destroy; a concurrent operation on the same session returns `409`.
-- Terraform providers are stored in the shared project `.terraform-plugin-cache/`.
-  It is configured as a local filesystem mirror. `terraform init` does not
-  download providers or automatically upgrade them; it only uses versions
-  present in that directory. A missing provider fails initialization clearly
-  instead of downloading it in the background.
+- Terraform first looks for providers in the shared project `.terraform-plugin-cache/`
+  directory as a local filesystem mirror and does not automatically upgrade them.
+  If a provider is missing, the `direct {}` fallback may download it from the
+  registry; without registry access, initialization fails clearly.
 - When the agent already ran a complete infrastructure check during the request, the final review reuses that result unless the Terraform files changed afterwards.
 - A configuration error from `validate`, the scan, or `plan` is corrected in the generated HCL and checked once more, for at most two complete reviews per request. The agent also stops when a repair does not change the files and never claims the infrastructure was created when the final review failed. Missing CLI, a provider download timeout, and missing AWS credentials stop the retry loop. The scan does not apply anything.
 - `local-exec`, `remote-exec`, provisioners, and `data "external"` are rejected before they are written.
@@ -220,14 +235,14 @@ InfraAgent turns a natural-language infrastructure request into Terraform for AW
   original request context.
 - Small requests may use `main.tf`; multi-component infrastructure is split into focused files such as `versions.tf`, `provider.tf`, `network.tf`, `compute.tf`, `database.tf`, `storage.tf`, and `outputs.tf`. Terraform loads these files together from the session directory.
 - For the default production-oriented security baseline, the agent prioritizes RDS PostgreSQL TLS enforcement and least-privilege KMS policies. S3 replication, access-logging buckets, and event notifications remain optional unless explicitly requested because they expand scope and cost.
-- The default scan policy accepts the optional S3 scope findings `CKV_AWS_18` (access logging), `CKV2_AWS_61` (lifecycle retention), `CKV_AWS_144` (cross-region replication), and `CKV2_AWS_62` (event notifications) as non-blocking warnings. The scan output explains each acceptance; other Checkov failures continue to block approval.
+- The default scan policy accepts `CKV_AWS_382` for the minimal EC2 baseline because outbound access is needed for SSM, package repositories, and AWS APIs without a requested VPC endpoint/NAT design. It also accepts the optional S3 scope findings `CKV_AWS_18` (access logging), `CKV2_AWS_61` (lifecycle retention), `CKV_AWS_144` (cross-region replication), and `CKV2_AWS_62` (event notifications) as non-blocking warnings. The scan output explains each acceptance; other Checkov failures continue to block approval.
 - The reply names the resources and why they are configured that way. A configuration error includes what the message means and what changed.
 
 `session_id` is a single directory name: letters, digits, `_`, and `-`, at most 64 characters.
 
 ## Approval
 
-A successful `terraform plan` and a passing Checkov scan store a digest of the `*.tf` files. A new chat message invalidates it. A failed scan does not store the digest and does not run `apply`.
+A successful `terraform plan` and a passing Checkov scan store a digest of the `*.tf` files. With explicit `skip_checkov: true`, the scan is skipped but the digest can still be stored. A new chat message invalidates it. Failed Terraform validation or a failed plan do not store the digest and do not run `apply`.
 
 - `POST /sessions/{session_id}/apply` with `{"approve": true}` runs `terraform apply` when the apply-plan digest still matches the files.
 - `POST /sessions/{session_id}/plans/destroy` runs `terraform plan -destroy` and deletes nothing. On success it stores a separate digest.

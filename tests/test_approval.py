@@ -6,12 +6,15 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.main import app
+from app.api import routes
 from app.api.routes import _command_body, _plan_summary
 from app.services.agent import AgentTurn
+from app.services.agent_context import write_conversation
 from app.services.approval import files_digest, matching_receipt, write_receipt
-from app.services.sessions import delete_session, list_sessions, touch_session
+from app.services.sessions import delete_session, list_sessions, start_operation, touch_session
 from app.services.sessions import WORKSPACE_ROOT
 from app.services.terraform import CommandResult
+from app.services.workspace_lock import WorkspaceBusyError
 
 _FAKE = Settings(
     openai_api_key="sk-test",
@@ -42,6 +45,78 @@ class ApprovalApiTests(unittest.TestCase):
 
         session = next(item for item in list_sessions() if item["id"] == self.session)
         self.assertEqual(session["title"], "Photo database")
+
+    def test_create_session_persists_before_rename(self) -> None:
+        response = self.client.post(f"/sessions/{self.session}")
+
+        self.assertEqual(response.status_code, 201)
+        renamed = self.client.patch(
+            f"/sessions/{self.session}",
+            json={"title": "Production environment"},
+        )
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()["title"], "Production environment")
+
+    def test_conversation_endpoint_reads_persisted_agent_history(self) -> None:
+        self.workspace.mkdir(parents=True)
+        write_conversation(
+            self.workspace / ".agent-conversation.json",
+            [
+                {"role": "user", "content": "Create a VPC"},
+                {"role": "assistant", "content": "Created the VPC configuration."},
+            ],
+        )
+
+        response = self.client.get(f"/sessions/{self.session}/conversation")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["messages"], [
+            {"role": "user", "content": "Create a VPC"},
+            {"role": "assistant", "content": "Created the VPC configuration."},
+        ])
+
+    def test_message_does_not_replace_custom_session_title(self) -> None:
+        touch_session(self.session, "Production environment")
+        turn = AgentTurn(
+            reply="ok",
+            files=[],
+            validation=_result(True),
+            plan=_result(False),
+            scan=_result(False),
+            registry_docs=False,
+        )
+        with patch("app.api.routes.InfraAgent") as agent:
+            agent.return_value.run.return_value = turn
+            response = self.client.post(
+                f"/sessions/{self.session}/messages",
+                json={"message": "Create a VPC in Frankfurt"},
+            )
+        self.assertEqual(response.status_code, 200)
+        session = next(item for item in list_sessions() if item["id"] == self.session)
+        self.assertEqual(session["title"], "Production environment")
+
+    def test_missing_region_is_clarified_without_starting_agent(self) -> None:
+        touch_session(self.session)
+        with patch("app.api.routes.InfraAgent") as agent:
+            response = self.client.post(
+                f"/sessions/{self.session}/messages",
+                json={"message": "I need a database for images"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Which AWS region", response.json()["reply"])
+        agent.assert_not_called()
+
+    def test_message_returns_conflict_when_workspace_lease_is_busy(self) -> None:
+        touch_session(self.session)
+        with patch(
+            "app.api.routes.workspace_lease",
+            side_effect=WorkspaceBusyError,
+        ):
+            response = self.client.post(
+                f"/sessions/{self.session}/messages",
+                json={"message": "Create a VPC in Frankfurt"},
+            )
+        self.assertEqual(response.status_code, 409)
 
     def tearDown(self) -> None:
         self.settings.stop()
@@ -117,6 +192,31 @@ class ApprovalApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         service.assert_not_called()
 
+    def test_cancel_operation_keeps_cancelled_status(self) -> None:
+        touch_session(self.session)
+        operation_id = start_operation(self.session, "apply")
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        service = FakeService()
+        routes._ACTIVE_SERVICES[(self.session, operation_id)] = service
+        try:
+            response = self.client.post(
+                f"/sessions/{self.session}/operations/{operation_id}/cancel",
+            )
+        finally:
+            routes._ACTIVE_SERVICES.pop((self.session, operation_id), None)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "cancelled")
+        self.assertEqual(response.json()["summary"], "Cancellation requested.")
+        self.assertTrue(service.cancelled)
+
     def test_invalid_session(self) -> None:
         response = self.client.post("/sessions/a.b/apply", json={"approve": True})
         self.assertEqual(response.status_code, 400)
@@ -174,7 +274,7 @@ class ApprovalApiTests(unittest.TestCase):
             agent.return_value.run.return_value = turn
             response = self.client.post(
                 f"/sessions/{self.session}/messages",
-                json={"message": "leave it"},
+                json={"message": "leave it in eu-central-1"},
             )
         self.assertEqual(response.status_code, 200)
         self.assertFalse((self.workspace / ".infraagent" / "apply.json").exists())
@@ -194,7 +294,7 @@ class ApprovalApiTests(unittest.TestCase):
             agent.return_value.run.return_value = turn
             response = self.client.post(
                 f"/sessions/{self.session}/messages",
-                json={"message": "leave it"},
+                json={"message": "leave it in eu-central-1"},
             )
         self.assertEqual(response.status_code, 200)
         self.assertFalse((self.workspace / ".infraagent" / "apply.json").exists())
@@ -219,7 +319,7 @@ class ApprovalApiTests(unittest.TestCase):
             agent.return_value.run.side_effect = run_with_progress
             response = self.client.post(
                 f"/sessions/{self.session}/messages/stream",
-                json={"message": "create it"},
+                json={"message": "create it in eu-central-1"},
             )
         self.assertEqual(response.status_code, 200)
         self.assertIn("event: status", response.text)
