@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,11 +19,14 @@ class Settings(BaseSettings):
 
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
+    aws_session_token: str = ""
     aws_region: str = "eu-central-1"
     openai_api_key: str = ""
     openai_model: str = "gpt-5.4-mini"
     braintrust_api_key: str = ""
+    terraform_mcp_url: str = ""
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings.settings_cached()
+    return Settings()

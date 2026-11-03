@@ -2,13 +2,38 @@
 .venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Terraform and generated session state
 .terraform/
 *.tfstate
 *.tfstate.*
 workspace/.terraform/
-workspace/*.tfstate
-workspace/*.tfstate.*
+workspace/.terraform-plugin-cache/
+workspace/.sessions.sqlite3*
+workspace/*/.terraform/
+workspace/*/.terraform.lock.hcl
+workspace/*/.infraagent/
+workspace/*/.agent-job.json
+workspace/*/.agent-conversation.json
+.terraform-plugin-cache/
+.terraform-agent.tfrc
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Build and packaging output
 *.egg-info/
 dist/
 build/
+
+# Local notes and editor/system files
 keepinmind.txt
+.DS_Store
+Thumbs.db

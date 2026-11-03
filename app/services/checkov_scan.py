@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+import re
 
 from app.services.terraform import CommandResult
 
@@ -67,13 +68,25 @@ class CheckovService:
         missing = "No module named checkov" in stderr or "No module named checkov" in (
             completed.stdout or ""
         )
+        output = "\n".join(part for part in (completed.stdout or "", stderr) if part)
+        accepted = _accepted_findings(output)
+        accepted_only = _only_accepted_findings(output)
         return CommandResult(
-            ok=completed.returncode == 0,
+            ok=completed.returncode == 0 or accepted_only,
             command=command,
-            stdout=completed.stdout or "",
+            stdout=(completed.stdout or "") + (
+                "\nAccepted policy findings:\n"
+                + "\n".join(
+                    f"- {finding}: {_ACCEPTED_POLICY_FINDINGS[finding]}"
+                    for finding in sorted(accepted)
+                )
+                if accepted
+                else ""
+            ),
             stderr=stderr,
             returncode=completed.returncode,
             missing_binary=missing,
+            policy_warnings=sorted(accepted),
         )
 
 
@@ -103,3 +116,32 @@ def _text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+_ACCEPTED_POLICY_FINDINGS = {
+    "CKV_AWS_18": (
+        "S3 access logging is optional here; enabling it requires a separate "
+        "logging bucket and adds storage and management cost."
+    ),
+    "CKV2_AWS_61": (
+        "S3 lifecycle rules are optional here; no automatic deletion or retention "
+        "period was requested, so object retention remains under user control."
+    ),
+    "CKV_AWS_144": (
+        "S3 cross-region replication is optional here; it requires a second region "
+        "and additional storage and transfer cost."
+    ),
+    "CKV2_AWS_62": (
+        "S3 event notifications are optional here; no event consumer or notification "
+        "workflow was requested."
+    ),
+}
+
+
+def _accepted_findings(output: str) -> set[str]:
+    return set(re.findall(r"CKV(?:2_)?AWS_\d+", output)) & set(_ACCEPTED_POLICY_FINDINGS)
+
+
+def _only_accepted_findings(output: str) -> bool:
+    findings = set(re.findall(r"CKV(?:2_)?AWS_\d+", output))
+    return bool(findings) and findings <= set(_ACCEPTED_POLICY_FINDINGS)
