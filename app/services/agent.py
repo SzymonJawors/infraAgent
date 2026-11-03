@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -15,7 +15,7 @@ from app.services.hcl_guard import rejected_hcl
 from app.services.scanner import WorkspaceScanner
 from app.services.approval import files_digest
 from app.services.terraform import CommandResult, TerraformService
-from app.services.builder import BuilderAgent
+from app.services.agent_core import AgentCore
 from app.services.planner import PlannerAgent
 from app.services.reviewer import ReviewAgent, credentials_missing, non_retryable
 from app.services.timing import Timing
@@ -32,6 +32,8 @@ current session workspace, validate it, and explain only what actually changed.
   It never applies or destroys infrastructure.
 - Use Terraform Registry tools for provider documentation when available; continue from knowledge
   if they are unavailable.
+- Always call `read_workspace()` before the first `write_tf()` call, including for an empty
+  workspace. A write attempted before that read is rejected; call `read_workspace()` and retry.
 
 # Terraform rules
 - Use responsibility-based files (`versions.tf`, `provider.tf`, `network.tf`, `compute.tf`,
@@ -63,10 +65,14 @@ current session workspace, validate it, and explain only what actually changed.
   Stop on non-retryable provider, Terraform, credential, or infrastructure errors.
 - For `CKV_AWS_394`, use pinned AZ names matching the confirmed region, not indexed AZ data.
 - Reply in the user's latest language. Chat never applies or destroys; those require approval.
-- Keep the final reply short and current with exactly `Changed`, `Validation`, and `Next step` only
-  when needed. Do not repeat old settings, reports, or optional follow-up offers."""
+- Keep the final reply useful and concrete, not artificially short. For every meaningful change,
+  explain: what was added or changed, why it was needed, and how it works or affects the result.
+  Do not only list filenames or Checkov rule IDs. Prefer clear sections such as "What changed",
+  "Why", "How it works", "Validation", and "Next step"; use as many of these as the result needs.
+  Keep one blank line between sections, avoid blank lines between consecutive bullets, and do not
+  repeat old settings, reports, or optional follow-up offers."""
 
-_MAX_VALIDATE = 2
+_MAX_VALIDATE = 5
 class AgentCancelled(Exception):
     """Raised when a user cancels an active agent job."""
 _TERMINATION_PROTECTION_REQUEST = re.compile(
@@ -87,6 +93,7 @@ class AgentTurn:
     plan: CommandResult
     scan: CommandResult
     registry_docs: bool
+    tool_calls: list[str] = field(default_factory=list)
 
 
 class InfraAgent:
@@ -136,10 +143,14 @@ class InfraAgent:
             skip_checkov,
             preflight=lambda: _database_subnet_group_issue(scanner.read()),
         )
+        workspace_read = False
 
         def write_tf(filename: str, content: str) -> str:
             """Write one .tf file in the session directory."""
             ensure_active()
+            gate_error = _write_requires_workspace_read(workspace_read)
+            if gate_error:
+                return gate_error
             name = Path(filename).name
             if name != filename or not name.endswith(".tf") or name in {".tf"}:
                 return "Rejected: only a plain *.tf filename is allowed."
@@ -168,7 +179,9 @@ class InfraAgent:
 
         def read_workspace() -> str:
             """Read the .tf files already in this session."""
+            nonlocal workspace_read
             ensure_active()
+            workspace_read = True
             existing = scanner.read()
             return existing or "Workspace is empty."
 
@@ -228,14 +241,17 @@ class InfraAgent:
                 registry_docs=False,
             )
         if existing:
-            context.append(f"Existing Terraform files: {', '.join(scanner.files())}")
+            context.append(_workspace_summary(existing, scanner.files()))
             context.append(
-                "This is a follow-up against the existing workspace. Inspect the content below, make the requested edit, "
-                "and validate it. Do not only describe a possible fix.\n\n"
-                f"{_model_output(existing, 12000)}"
+                "This is a follow-up against the existing workspace. Call read_workspace() to inspect "
+                "the full HCL, preserve unrelated resources, make the requested edit, and validate it. "
+                "Do not only describe a possible fix."
             )
         else:
             context.append("The session has no Terraform files yet.")
+        repository_context = _read_repository_context(self.workspace)
+        if repository_context:
+            context.append(repository_context)
         history_context = ""
         if conversation:
             history_items: list[str] = []
@@ -265,9 +281,9 @@ class InfraAgent:
             user_text += (
                 "\n\n# Fast path\n"
                 "This is a simple request. Do not use Terraform Registry tools. "
-                "Write the required files and call check_infrastructure exactly once. "
-                "Do not perform a repair pass unless the files were actually changed "
-                "after a failed review."
+                "Write the required files and call check_infrastructure once initially. "
+                "If validation or Checkov reports a blocking finding, perform one repair pass, "
+                "then call check_infrastructure again before finishing."
             )
 
         async def invoke_graph() -> tuple[dict, bool]:
@@ -277,7 +293,7 @@ class InfraAgent:
                 api_key=self.settings.openai_api_key,
             )
             planner = PlannerAgent(self.settings)
-            builder = BuilderAgent(model, _SYSTEM_PROMPT, _MAX_VALIDATE)
+            core = AgentCore(model, _SYSTEM_PROMPT, _MAX_VALIDATE)
             use_registry = _should_use_registry_tools(message, existing) and not fast_path
             if fast_path:
                 registry_tools, registry_docs, registry_client = [], False, None
@@ -296,7 +312,7 @@ class InfraAgent:
             )
             try:
                 tools = [write_tf, read_workspace, check_infrastructure, *registry_tools]
-                result = await builder.run(
+                result = await core.run(
                     prompt=builder_text,
                     tools=tools,
                     fallback_tools=[write_tf, read_workspace, check_infrastructure],
@@ -313,7 +329,7 @@ class InfraAgent:
             except RuntimeError as exc:
                 if str(exc).strip().lower() != "event loop is closed":
                     raise
-                result = await builder.run(
+                result = await core.run(
                     prompt=builder_text,
                     tools=[write_tf, read_workspace, check_infrastructure],
                     fallback_tools=[write_tf, read_workspace, check_infrastructure],
@@ -336,20 +352,28 @@ class InfraAgent:
                 model=self.settings.openai_model,
                 api_key=self.settings.openai_api_key,
             )
-            builder = BuilderAgent(model, _SYSTEM_PROMPT, _MAX_VALIDATE)
-            result = builder.run_sync(
-                prompt=user_text,
-                tools=[write_tf, read_workspace, check_infrastructure],
-                fallback_tools=[write_tf, read_workspace, check_infrastructure],
-                fast_path=fast_path,
-                files_digest=lambda: files_digest(self.workspace),
-                review_state=reviewer.current,
-                should_stop=lambda review: reviewer.exhausted
-                or non_retryable(*review) is not None,
-                model_output=_model_output,
-                timing=timing,
-                skip_checkov=skip_checkov,
-            )
+            core = AgentCore(model, _SYSTEM_PROMPT, _MAX_VALIDATE)
+            try:
+                result = core.run_sync(
+                    prompt=user_text,
+                    tools=[write_tf, read_workspace, check_infrastructure],
+                    fallback_tools=[write_tf, read_workspace, check_infrastructure],
+                    fast_path=fast_path,
+                    files_digest=lambda: files_digest(self.workspace),
+                    review_state=reviewer.current,
+                    should_stop=lambda review: reviewer.exhausted
+                    or non_retryable(*review) is not None,
+                    model_output=_model_output,
+                    timing=timing,
+                    skip_checkov=skip_checkov,
+                )
+            except GraphRecursionError:
+                progress(
+                    "reviewing",
+                    "Finishing the review after the iteration limit...",
+                    "Terraform review" if skip_checkov else "Terraform and Checkov review",
+                )
+                result = {"messages": []}
             registry_docs = False
         else:
             try:
@@ -421,6 +445,7 @@ class InfraAgent:
             plan=plan,
             scan=scan,
             registry_docs=registry_docs,
+            tool_calls=_tool_calls(result),
         )
 
 
@@ -447,6 +472,90 @@ def _model_output(text: str, limit: int = 3000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n...[truncated for model context]"
+
+
+def _tool_calls(result: object) -> list[str]:
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    calls: list[str] = []
+    for message in messages:
+        raw_calls = (
+            message.get("tool_calls", [])
+            if isinstance(message, dict)
+            else getattr(message, "tool_calls", [])
+        )
+        for call in raw_calls or []:
+            if isinstance(call, dict):
+                name = call.get("name") or call.get("function", {}).get("name")
+            else:
+                name = getattr(call, "name", None)
+            if name:
+                calls.append(str(name))
+    return calls
+
+
+def _write_requires_workspace_read(workspace_read: bool) -> str | None:
+    if workspace_read:
+        return None
+    return (
+        "Rejected: read_workspace() must be called before write_tf(). "
+        "Read the current Terraform workspace first, then retry the write."
+    )
+
+
+def _workspace_summary(terraform: str, filenames: list[str]) -> str:
+    addresses = sorted(set(
+        f"{kind}.{resource_type}.{name}"
+        for kind, resource_type, name in re.findall(
+            r'^\s*(resource|data)\s+"([^"]+)"\s+"([^"]+)"\s*\{',
+            terraform,
+            re.MULTILINE,
+        )
+    ))
+    modules = sorted(set(re.findall(r'^\s*module\s+"([^"]+)"\s*\{', terraform, re.MULTILINE)))
+    providers = sorted(set(re.findall(r'^\s*provider\s+"([^"]+)"\s*\{', terraform, re.MULTILINE)))
+    lines = len(terraform.splitlines())
+    summary = [
+        f"Existing Terraform workspace: {len(filenames)} file(s), {lines} line(s).",
+        f"Files: {', '.join(filenames)}.",
+        f"Resources: {', '.join(addresses) if addresses else 'none detected'}.",
+        f"Modules: {', '.join(modules) if modules else 'none detected'}.",
+        f"Providers: {', '.join(providers) if providers else 'none detected'}.",
+    ]
+    return "\n".join(summary)
+
+
+def _read_repository_context(workspace: Path) -> str:
+    path = workspace / ".github-repository-analysis.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    repository = str(payload.get("repository") or "").strip()
+    if not repository:
+        return ""
+    technologies = payload.get("technologies")
+    technology_text = ", ".join(
+        str(item) for item in technologies if isinstance(item, str)
+    ) if isinstance(technologies, list) else "none detected"
+    terraform_files = payload.get("terraform_files")
+    terraform_text = ", ".join(
+        str(item) for item in terraform_files[:30] if isinstance(item, str)
+    ) if isinstance(terraform_files, list) else "none"
+    readme = str(payload.get("readme_excerpt") or "").strip()
+    if len(readme) > 2500:
+        readme = readme[:2500].rstrip() + "..."
+    return (
+        "# GitHub repository analysis\n"
+        f"Repository: {repository}\n"
+        f"Detected technologies: {technology_text}\n"
+        f"Terraform files: {terraform_text}\n"
+        f"Recommendation: {payload.get('recommendation', '')}\n"
+        "Use this as bounded architecture context only. Do not claim to have inspected files "
+        "that are not listed here, and do not write credentials or application source code.\n"
+        f"README excerpt:\n{readme or '(not available)'}"
+    )
 
 
 def _command_message(command: str) -> str:
@@ -549,12 +658,14 @@ _OPTIONAL_FOLLOW_UP = re.compile(
 
 def _finalize_reply(reply: str) -> str:
     """Keep agent replies focused on the completed result and required action."""
-    paragraphs = re.split(r"\n\s*\n", reply.strip())
+    compact = re.sub(r"[ \t]+\n", "\n", reply.strip())
+    compact = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", compact)
+    paragraphs = re.split(r"\n\s*\n", compact)
     for index, paragraph in enumerate(paragraphs):
         if _OPTIONAL_FOLLOW_UP.search(paragraph):
             paragraphs = paragraphs[:index]
             break
-    return "\n\n".join(paragraphs).strip() or reply.strip()
+    return "\n\n".join(paragraphs).strip() or compact
 
 
 def _as_text(content: object) -> str:

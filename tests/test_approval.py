@@ -1,5 +1,8 @@
+import json
+import io
 import shutil
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -10,7 +13,7 @@ from app.api import routes
 from app.api.routes import _command_body, _plan_summary
 from app.services.agent import AgentTurn
 from app.services.agent_context import write_conversation
-from app.services.approval import files_digest, matching_receipt, write_receipt
+from app.services.approval import files_digest, matching_receipt, read_receipt, write_receipt
 from app.services.sessions import delete_session, list_sessions, start_operation, touch_session
 from app.services.sessions import WORKSPACE_ROOT
 from app.services.terraform import CommandResult
@@ -75,6 +78,26 @@ class ApprovalApiTests(unittest.TestCase):
             {"role": "assistant", "content": "Created the VPC configuration."},
         ])
 
+    def test_export_contains_terraform_without_workspace_artifacts(self) -> None:
+        self.workspace.mkdir(parents=True)
+        (self.workspace / "main.tf").write_text(
+            'resource "aws_s3_bucket" "private" {}',
+            encoding="utf-8",
+        )
+        (self.workspace / "terraform.tfstate").write_text("sensitive state", encoding="utf-8")
+        (self.workspace / ".agent-job.json").write_text("internal state", encoding="utf-8")
+
+        response = self.client.get(f"/sessions/{self.session}/export")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(
+                set(archive.namelist()),
+                {"main.tf", "README.md"},
+            )
+            self.assertIn("aws_s3_bucket", archive.read("main.tf").decode())
+
     def test_message_does_not_replace_custom_session_title(self) -> None:
         touch_session(self.session, "Production environment")
         turn = AgentTurn(
@@ -132,6 +155,34 @@ class ApprovalApiTests(unittest.TestCase):
         file.write_text("b\n", encoding="utf-8")
         self.assertNotEqual(first, files_digest(self.workspace))
         self.assertFalse(matching_receipt(self.workspace, "apply"))
+
+    def test_receipt_stores_plan_artifact_metadata(self) -> None:
+        self.workspace.mkdir(parents=True)
+        (self.workspace / "main.tf").write_text("a\n", encoding="utf-8")
+
+        write_receipt(
+            self.workspace,
+            "apply",
+            plan_output="Plan: 1 to add, 0 to change, 0 to destroy.",
+            session_id=self.session,
+        )
+        receipt = read_receipt(self.workspace, "apply")
+
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["session_id"], self.session)
+        self.assertIn("Plan: 1 to add", receipt["plan_output"])
+
+    def test_expired_receipt_is_removed(self) -> None:
+        self.workspace.mkdir(parents=True)
+        (self.workspace / "main.tf").write_text("a\n", encoding="utf-8")
+        write_receipt(self.workspace, "apply")
+        path = self.workspace / ".infraagent" / "apply.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["created_at"] = "2020-01-01T00:00:00+00:00"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertFalse(matching_receipt(self.workspace, "apply"))
+        self.assertFalse(path.exists())
 
     def test_apply_without_receipt_does_not_call_terraform(self) -> None:
         with patch("app.api.routes.TerraformService") as service:
@@ -365,7 +416,26 @@ class ApprovalApiTests(unittest.TestCase):
 
         self.assertEqual((summary.to_add, summary.to_change, summary.to_destroy), (2, 1, 0))
         self.assertEqual(summary.resources, ["aws_db_instance.main", "aws_instance.server"])
+        self.assertEqual(
+            [(item.address, item.action) for item in summary.resource_actions],
+            [
+                ("aws_db_instance.main", "create"),
+                ("aws_instance.server", "create"),
+            ],
+        )
         self.assertTrue(summary.cost_warnings)
+
+    def test_plan_summary_warns_for_s3_and_kms_costs(self) -> None:
+        summary = _plan_summary(
+            """
+            # aws_s3_bucket.private will be created
+            # aws_kms_key.s3 will be created
+            Plan: 2 to add, 0 to change, 0 to destroy.
+            """
+        )
+
+        self.assertTrue(any("S3" in warning for warning in summary.cost_warnings))
+        self.assertTrue(any("KMS" in warning for warning in summary.cost_warnings))
 
     def test_zero_destroy_plan_does_not_create_receipt(self) -> None:
         self.workspace.mkdir(parents=True)

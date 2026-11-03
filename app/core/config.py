@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-5.4-mini"
     braintrust_api_key: str = ""
     terraform_mcp_url: str = ""
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_redirect_uri: str = "http://127.0.0.1:8000/github/callback"
+    github_frontend_url: str = "http://127.0.0.1:5173"
 
 
 @lru_cache(maxsize=1)

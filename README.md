@@ -1,332 +1,320 @@
 # InfraAgent
 
+InfraAgent is an AI infrastructure assistant that turns natural-language AWS
+requests into validated Terraform configuration. It uses a bounded ReAct
+tool loop, deterministic Terraform and Checkov review, cost signals, and an
+explicit approval workflow before any infrastructure changes are applied.
+
+> **Author:** [Szymon Jawors](https://github.com/SzymonJawors)
+
 Licensed under the [Apache License 2.0](./LICENSE).
 
-## Polski
+## What it does
 
-InfraAgent zamienia polecenie w języku naturalnym na konfigurację Terraform dla AWS. Każda sesja ma własny katalog roboczy. Wygenerowana konfiguracja jest formatowana, inicjalizowana i walidowana. Gdy skonfigurowane są poświadczenia AWS, to samo żądanie zwraca także `terraform plan`.
-
-`apply` i `destroy` nie wychodzą z czatu. Każde wymaga osobnego żądania HTTP z `{"approve": true}` i skrótu plików z ostatniego planu tego rodzaju.
-
-### Zakres
-
-- `GET /health` zwraca `{"status":"ok"}`, gdy proces działa.
-- `POST /sessions/{session_id}` tworzy pustą sesję przed jej użyciem lub zmianą
-  nazwy. Tytuł sesji jest niezależny od treści wiadomości czatu.
-- `POST /sessions/{session_id}/messages` przyjmuje `{"message": "..."}` i zapisuje pliki `.tf` w `workspace/{session_id}/`. Opcjonalne `skip_checkov: true` pomija skan Checkov tylko dla tego żądania i jest przeznaczone wyłącznie do szybkiego podglądu.
-- `POST /sessions/{session_id}/messages/stream` wysyła postęp generowania przez
-  Server-Sent Events (`status`, `result`, `error`); zwykły endpoint pozostaje
-  dostępny dla klientów bez obsługi streamingu.
-- `GET /sessions/{session_id}/agent-status` zwraca trwały status zadania. Praca
-  agenta jest kontynuowana po przełączeniu czatu, a frontend odtwarza wynik po
-  powrocie do sesji.
-- `POST /sessions/{session_id}/agent-cancel` anuluje aktywne zadanie agenta bez
-  usuwania istniejących plików Terraform.
-- `GET /sessions/{session_id}/operations` pokazuje historię generowania, planów,
-  apply i destroy dla sesji.
-- `GET /sessions/{session_id}/conversation` zwraca trwale zapisaną historię
-  rozmowy z workspace'u sesji; frontend używa jej jako źródła prawdy po
-  ponownym otwarciu sesji.
-- Frontend używa WebSocket do natychmiastowego postępu; SSE pozostaje dostępne
-  jako fallback.
-- MCP jest pomijany przy prostych zmianach istniejącego workspace'u i używany
-  dla nowych konfiguracji oraz próśb o dokumentację providera.
-- Dokumentacja rejestru korzysta z Terraform MCP przez Streamable HTTP. Backend automatycznie uruchamia lokalną binarkę MCP na `http://127.0.0.1:8080/mcp`; `TERRAFORM_MCP_URL` pozwala wskazać własny działający serwer.
-- Po zapisie plików agent uruchamia `terraform fmt`, `terraform init -backend=false` i `terraform validate`, a potem skan Checkov. Przy obecnych poświadczeniach AWS uruchamia następnie `terraform plan`. Przy `skip_checkov: true` pomija Checkov i dodatkowe próby naprawy, ale nadal wykonuje walidację Terraform oraz plan.
-- Dla RDS agent nie zgaduje `engine_version`, ponieważ dostępne wersje zależą od regionu i klasy instancji. Jeśli wersja nie została potwierdzona, pole jest pomijane.
-- Dla złożonych żądań orchestrator rozdziela pracę na Planner Agent (analiza
-  kontekstu), Builder Agent (jedyny agent zapisujący Terraform) oraz
-  deterministyczne etapy Validator/Security. Planner i dokumentacja MCP mogą
-  działać równolegle. Proste żądania korzystają z krótkiej ścieżki bez MCP.
-- W ramach jednego żądania powtórne wywołania review dla niezmienionych plików
-  korzystają z poprzedniego wyniku. `terraform init` uruchamia się ponownie
-  tylko po zmianie `versions.tf`, `provider.tf` albo lockfile.
-- Każdy workspace ma nieblokującą blokadę plikową `.infraagent/workspace.lock`.
-  Obejmuje ona generowanie, walidację, plan, apply i destroy; równoległa
-  operacja na tej samej sesji kończy się kodem `409`.
-- Każde żądanie mierzy czas Plannera, Buildera, review, Checkov oraz
-  pojedynczych komend Terraform. Czasy są zapisywane w logu `agent_timing` i
-  wysyłane do klienta jako końcowy event `metrics`.
-- Provider Terraform jest najpierw szukany we wspólnym `.terraform-plugin-cache/`
-  w katalogu projektu jako lokalny filesystem mirror. `terraform init` nie wykonuje
-  automatycznego upgrade'u. Jeśli providera nie ma w cache, konfiguracja ma fallback
-  `direct {}` i Terraform może pobrać go z registry; bez dostępu do registry init
-  kończy się czytelnym błędem.
-- Błąd konfiguracji z `validate`, skanu albo `plan` jest poprawiany w wygenerowanym HCL i sprawdzany ponownie najwyżej jeden raz (maksymalnie dwa pełne review na żądanie). Agent zatrzymuje się także, gdy pliki nie zmieniły się po poprawce. Nie ogłasza utworzenia infrastruktury, jeśli końcowy review nie przeszedł. Brak CLI, timeout pobierania providera i brak poświadczeń AWS kończą pętlę poprawek. Skan niczego nie wdraża.
-- `local-exec`, `remote-exec`, provisionery oraz `data "external"` są odrzucane przed zapisem.
-- Kolejna wiadomość w tej samej sesji odczytuje pliki już zapisane dla tej sesji i kasuje poprzednie potwierdzenia planu.
-- Ostatnie wiadomości rozmowy są zapisywane prywatnie w workspace sesji, dzięki
-  czemu odpowiedzi na pytania doprecyzowujące (np. sam region) zachowują
-  kontekst pierwotnej prośby.
-- Odpowiedź opisuje zasoby i powód ich ustawień. Przy błędzie konfiguracji opisuje komunikat i poprawkę.
-
-### Struktura projektu
-
-- `app/api/routes.py` zawiera endpointy HTTP i pozostaje cienką warstwą wejściową.
-- `app/api/schemas.py` zawiera modele requestów i odpowiedzi API.
-- `app/core/` zawiera konfigurację i logging.
-- `app/services/` zawiera logikę agenta, Terraform, skanowanie bezpieczeństwa,
-  workspace oraz approval.
-- Role agenta są rozdzielone na `planner.py` (analiza tylko do odczytu),
-  `builder.py` (jedyny etap zapisujący Terraform), `reviewer.py` (walidacja,
-  Checkov i plan) oraz `agent.py` jako koordynator.
-- `frontend/src/components/` zawiera widoki panelu, a `frontend/src/lib/`
-  komunikację z API i typy kontraktu.
-- `workspace/` to lokalne katalogi sesji; `tools/` zawiera opcjonalne narzędzia
-  uruchamiane przez agenta.
-
-`session_id` to pojedyncza nazwa katalogu: litery, cyfry, `_` i `-`, najwyżej 64 znaki.
-
-### Zatwierdzenie
-
-Po udanym `terraform plan` i udanym skanie Checkov API zapisuje skrót plików `*.tf`. Przy świadomym `skip_checkov: true` skan jest pomijany, ale skrót nadal może zostać zapisany. Nowa wiadomość ten skrót unieważnia. Nieudana walidacja lub plan nie tworzą potwierdzenia i nie uruchamiają `apply`.
-
-- `POST /sessions/{session_id}/apply` z `{"approve": true}` uruchamia `terraform apply`, gdy skrót planu apply nadal pasuje do plików.
-- `POST /sessions/{session_id}/plans/destroy` uruchamia `terraform plan -destroy` i niczego nie kasuje. Przy sukcesie zapisuje osobny skrót.
-- `POST /sessions/{session_id}/destroy` z `{"approve": true}` uruchamia `terraform destroy` tylko dla skrótu planu destroy.
-- Przed zatwierdzonym destroy agent wyłącza ochronę terminacji EC2 (`disable_api_termination`), jeśli była włączona, aby AWS nie blokował usunięcia instancji.
-
-Brak zatwierdzenia daje `400`. Brak poświadczeń AWS daje `503`. Brak planu albo inny skrót plików daje `409`. AWS nie jest wtedy wywoływany. Wiadomość w czacie, także „tak”, nie zastępuje tych żądań.
-
-### Interfejs HTTP
-
-| Warunek | Wynik |
-| --- | --- |
-| Brak poświadczenia modelu językowego | `503` |
-| Niepoprawny `session_id` | `400` |
-| Brak `terraform` na `PATH` | Pliki zostają. `validation.missing_binary` ma wartość `true`. |
-| Brak poświadczeń AWS | Walidacja nadal się wykonuje. `plan` jest pomijany i nie jest wysyłany do AWS. |
-
-Treść odpowiedzi zawiera `reply`, `files`, `validation`, `plan`, `scan` i `registry_docs`.
-
-Przykład:
-
-```http
-POST /sessions/demo/messages
-Content-Type: application/json
-
-{"message":"Prywatny bucket S3 na backupy, z szyfrowaniem i blokadą publicznego dostępu"}
+```text
+User request
+    ↓
+Planner Agent (read-only context analysis)
+    ↓
+Builder Agent (bounded ReAct tool loop)
+    ↓
+Terraform fmt → init → validate → Checkov → plan
+    ↓
+Cost estimate and plan review
+    ↓
+Preview apply → explicit approval → apply
 ```
 
-### Wymagania
+The chat agent never runs `terraform apply` or `terraform destroy`. Those actions
+are separate API operations protected by a current plan receipt and an explicit
+approval request.
 
-- Python 3.14
-- Terraform na `PATH`, jeśli mają działać walidacja i plan
-- Binarka `tools/terraform-mcp-server.exe` pozostaje awaryjnym trybem lokalnym. Zalecany tryb uruchamia ją jako osobny serwis:
+### Main capabilities
 
-```powershell
-.\tools\terraform-mcp-server.exe streamable-http --transport-host 127.0.0.1 --transport-port 8080 --toolsets registry
+- Natural-language Terraform generation for AWS.
+- Per-session Terraform workspaces and persistent conversation history.
+- Planner, Builder, and deterministic Reviewer separation.
+- ReAct tools: `read_workspace`, `write_tf`, and `check_infrastructure`.
+- Read-before-write enforcement for every agent turn.
+- Terraform validation, Checkov security scanning, and AWS plan generation.
+- Structured review results with stage, category, retryability, and suggested action.
+- Bounded repair passes when validation or security checks fail.
+- Terraform Registry documentation through the Terraform MCP server.
+- AWS Pricing API estimates for supported resources and cost warnings for
+  S3, KMS, RDS, EC2, NAT Gateway, and CloudWatch Logs.
+- Apply preview, explicit apply approval, destroy preview, and destroy approval.
+- Approval artifacts bound to a file digest, plan output, session, and 30-minute TTL.
+- Live Terraform output, persistent operation history, and operation cancellation.
+- WebSocket progress with Server-Sent Events fallback.
+- Local evaluation suite and behavioral tool-trace scoring.
+
+## Architecture
+
+```text
+FastAPI
+├── API routes and Pydantic contracts
+├── Session and operation persistence (SQLite)
+└── InfraAgent coordinator
+    ├── PlannerAgent       read-only analysis
+    ├── AgentCore          shared sync/async tool-loop runner
+    ├── BuilderAgent       Terraform writes and bounded repairs
+    └── ReviewAgent        fmt, init, validate, Checkov, plan
+
+React + Vite frontend
+├── Chat and session history
+├── Terraform file and diff inspector
+├── Plan, cost, and security panels
+└── Apply/destroy controls with live operation status
 ```
 
-MCP działa jako osobny proces HTTP. Uruchom go przed backendem:
+### Repository structure
 
-```powershell
-.\tools\start-mcp.ps1
-```
+- `app/api/` — FastAPI routes and request/response schemas.
+- `app/core/` — configuration and application infrastructure.
+- `app/services/agent.py` — agent coordinator and Terraform tool definitions.
+- `app/services/agent_core.py` — shared Builder/ReAct execution contract.
+- `app/services/planner.py` — read-only planning and context analysis.
+- `app/services/builder.py` — write-capable agent and repair loop.
+- `app/services/reviewer.py` — deterministic validation, security, and plan review.
+- `app/services/terraform.py` — Terraform process execution and live output.
+- `app/services/approval.py` — plan receipts, digests, and approval expiry.
+- `app/services/checkov_scan.py` — Terraform security scanning.
+- `app/services/pricing.py` — best-effort AWS Pricing API lookup.
+- `frontend/src/` — React application.
+- `evals/` — local behavior and infrastructure-quality evaluations.
+- `tests/` — backend regression tests.
+- `workspace/` — local session workspaces.
 
-Sprawdź jego stan przez `http://127.0.0.1:8002/health` — odpowiedź zawiera pole `mcp.reachable`.
-Jeśli używasz własnego serwera MCP, ustaw `TERRAFORM_MCP_URL`.
+## Safety and approval model
 
-Poświadczenia AWS są wymagane dla `terraform plan`, `apply` i `destroy`. Sama walidacja działa bez nich.
+The agent can generate and review Terraform, but chat messages cannot deploy or
+destroy infrastructure.
 
-Terraform korzysta najpierw ze współdzielonego cache providerów, a następnie z bezpośredniego
-Terraform Registry. Dzięki temu zasoby wymagające dodatkowego providera, np. `archive_file` z
-`hashicorp/archive` dla Lambdy, nie kończą się błędem tylko dlatego, że provider nie był wcześniej
-pobrany do cache. Dostęp do `registry.terraform.io` nadal musi być możliwy przy pierwszym użyciu.
+### Apply flow
 
-### Instalacja
+1. The agent generates or updates Terraform.
+2. Terraform validation, Checkov, and plan must pass.
+3. The backend stores an apply approval artifact.
+4. **Preview apply** displays the stored plan without calling AWS to apply changes.
+5. **Approve & apply** checks the artifact again and starts `terraform apply`.
 
-```powershell
-py -3.14 -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-uvicorn app.main:app --reload
-```
+The artifact contains:
 
-Usługa nasłuchuje na [http://127.0.0.1:8000](http://127.0.0.1:8000). Kontrola życia: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health).
+- session id,
+- SHA-256 digest of all `.tf` files,
+- plan output,
+- operation kind,
+- creation timestamp.
 
-Obraz Dockera uruchamia proces API. Nie zawiera CLI Terraform ani skanerów bezpieczeństwa.
+It expires after 30 minutes. Any Terraform file change invalidates it. A missing,
+expired, or mismatched artifact returns `409`, and Terraform is not started.
 
-### Konfiguracja
+### Destroy flow
 
-Skopiować `.env.example` do `.env`. Pliku `.env` nie należy commitować.
+1. **Preview destroy** runs `terraform plan -destroy` and changes nothing.
+2. A separate destroy approval artifact is stored.
+3. **Approve destroy** verifies the artifact and starts `terraform destroy`.
+4. A protected EC2 instance is prepared for approved destruction when necessary.
 
-| Zmienna | Przeznaczenie |
-| --- | --- |
-| `OPENAI_API_KEY` | Poświadczenie modelu językowego. Nie trafia do plików `.tf` ani do logów. |
-| `OPENAI_MODEL` | Opcjonalny identyfikator modelu. |
-| `AWS_ACCESS_KEY_ID` | Przekazywany wyłącznie procesowi Terraform. |
-| `AWS_SECRET_ACCESS_KEY` | Przekazywany wyłącznie procesowi Terraform. |
-| `AWS_REGION` | Region procesu Terraform, gdy sam plik go nie ustawia. Domyślnie `eu-central-1`. Agent bierze region z polecenia i pyta, gdy go nie ma. |
+Apply and destroy run asynchronously. Their output is persisted and can be
+cancelled from the UI. A cancelled operation is reported as `cancelled`, not
+`failed`.
 
-Przy udanym planie agent wykonuje opcjonalne zapytania do AWS Pricing API przez
-AWS CLI (`aws pricing get-products`). Cena jest pokazana jako orientacyjny koszt
-miesięczny przy 730 godzinach. Integracja wymaga działającego `aws` na `PATH`
-i poświadczeń z dostępem do odczytu cen; korzysta z endpointu Pricing w
-`us-east-1`, niezależnie od regionu zasobów. Brak odpowiedzi API nie blokuje
-planu i jest oznaczany w interfejsie jako `Estimate unavailable`. Ostrzeżenia
-heurystyczne pozostają osobno i nie są wyceną.
+## Terraform and security rules
 
-### Bezpieczeństwo
+The agent:
 
-Poświadczenia AWS pozostają w środowisku procesu Terraform. Nie trafiają do promptu modelu ani do wygenerowanych plików. Wartości z `.env` są usuwane ze szczegółów błędów API. Provisionery i zewnętrzne źródła danych, które mogłyby uruchomić program podczas `plan`, są odrzucane przy zapisie.
+- never writes AWS credentials, passwords, or placeholder secrets to Terraform;
+- rejects `local-exec`, `remote-exec`, provisioners, and `data "external"`;
+- requires a confirmed AWS region;
+- avoids guessing region-specific RDS engine versions;
+- requires two Availability Zones for RDS subnet groups;
+- uses private networking, encryption, and blocked S3 public access where relevant;
+- does not hardcode region-specific AMI ids;
+- avoids `0.0.0.0/0` unless explicitly requested;
+- keeps `apply` and `destroy` outside the chat generation path.
 
-### Dalszy zakres
+Checkov findings accepted by default are optional scope items such as S3 access
+logging, lifecycle retention, cross-region replication, and event notifications.
+Other actionable findings block approval.
 
-- Obraz kontenera zawierający CLI Terraform i skanery
+## Cost estimation
 
-### Ewaluacje
+The plan panel reports:
 
-`python -m evals.run_eval` puszcza trzy polecenia na modelu, każde w osobnym katalogu tymczasowym. Klucze AWS są na czas przebiegu usuwane, a `apply` nie jest wołane. Wynik liczy lokalny kod: brak sekretów i provisionerów, brak wysłanego planu, a dla pełnego polecenia także walidacja i brak publicznego dostępu. Brak regionu ma skończyć się pytaniem, bez plików. Gdy ustawione jest `BRAINTRUST_API_KEY`, te same wyniki 0/1 trafiają do eksperymentu `InfraAgent`. Bez klucza przebieg zostaje na konsoli.
+- AWS Pricing API estimates where a reliable lookup is available;
+- per-resource pricing items;
+- warnings for usage-based or incomplete costs;
+- an explicit partial/unavailable status when AWS pricing data cannot be resolved.
 
-## English
-
-InfraAgent turns a natural-language infrastructure request into Terraform for AWS. Each session keeps its own workspace. Generated configuration is formatted, initialized, and validated. When AWS credentials are configured, the same request also produces a `terraform plan`.
-
-`apply` and `destroy` do not run from chat. Each one needs its own HTTP request with `{"approve": true}` and a file digest from the latest plan of that kind.
-
-## Capabilities
-
-- `GET /health` returns `{"status":"ok"}` when the process is running.
-- `POST /sessions/{session_id}/messages` accepts `{"message": "..."}` and writes `.tf` files under `workspace/{session_id}/`. Optional `skip_checkov: true` skips Checkov for that request only and is intended only for a quick preview.
-- `POST /sessions/{session_id}/messages/stream` returns Server-Sent Events
-  for progress (`status`), the final response (`result`), or a safe error
-  (`error`). The regular endpoint remains available for non-streaming clients.
-- `GET /sessions/{session_id}/agent-status` returns the persisted job status.
-  Agent work continues when switching chats, and the frontend restores the result
-  when returning to the session.
-- `POST /sessions/{session_id}/agent-cancel` cancels the active agent job without
-  deleting existing Terraform files.
-- `GET /sessions/{session_id}/operations` returns generation, plan, apply, and
-  destroy history for the session.
-- `GET /sessions/{session_id}/conversation` returns the persisted conversation
-  history from the session workspace. The frontend uses it as the source of
-  truth when reopening a session and falls back to local storage only when the
-  API is unavailable.
-- The frontend uses WebSocket for immediate progress; SSE remains available as a
-  fallback.
-- MCP is skipped for simple edits to an existing workspace and used for new
-  configurations or provider documentation requests.
-- Registry documentation uses Terraform MCP over Streamable HTTP. The backend automatically starts the bundled MCP binary at `http://127.0.0.1:8080/mcp`; `TERRAFORM_MCP_URL` can point to an existing service.
-- After the files are written, the agent runs `terraform fmt`, `terraform init -backend=false`, and `terraform validate`, then a Checkov scan. With AWS credentials present, it then runs `terraform plan`. With `skip_checkov: true`, Checkov and its extra repair attempts are skipped while Terraform validation and the plan still run.
-- For RDS, the agent does not guess `engine_version` because available versions depend on region and instance class. It omits the field unless the version was confirmed.
-- For complex requests, the orchestrator separates a Planner Agent (context
-  analysis), a Builder Agent (the only agent allowed to write Terraform), and
-  deterministic Validator/Security stages. Planner analysis and MCP
-  documentation can run in parallel. Simple requests use the short path
-  without MCP.
-- Within one request, repeated reviews of unchanged files reuse the previous
-  result. `terraform init` runs again only when `versions.tf`, `provider.tf`,
-  or the provider lock file changes.
-- Each workspace has a non-blocking file lease at
-  `.infraagent/workspace.lock`. It covers generation, validation, plan, apply,
-  and destroy; a concurrent operation on the same session returns `409`.
-- Terraform first looks for providers in the shared project `.terraform-plugin-cache/`
-  directory as a local filesystem mirror and does not automatically upgrade them.
-  If a provider is missing, the `direct {}` fallback may download it from the
-  registry; without registry access, initialization fails clearly.
-- When the agent already ran a complete infrastructure check during the request, the final review reuses that result unless the Terraform files changed afterwards.
-- A configuration error from `validate`, the scan, or `plan` is corrected in the generated HCL and checked once more, for at most two complete reviews per request. The agent also stops when a repair does not change the files and never claims the infrastructure was created when the final review failed. Missing CLI, a provider download timeout, and missing AWS credentials stop the retry loop. The scan does not apply anything.
-- `local-exec`, `remote-exec`, provisioners, and `data "external"` are rejected before they are written.
-- A later message in the same session reads the files already stored for that session and clears previous plan receipts.
-- Recent conversation turns are stored privately in the session workspace so
-  answers to clarifying questions (for example, a region alone) retain the
-  original request context.
-- Small requests may use `main.tf`; multi-component infrastructure is split into focused files such as `versions.tf`, `provider.tf`, `network.tf`, `compute.tf`, `database.tf`, `storage.tf`, and `outputs.tf`. Terraform loads these files together from the session directory.
-- For the default production-oriented security baseline, the agent prioritizes RDS PostgreSQL TLS enforcement and least-privilege KMS policies. S3 replication, access-logging buckets, and event notifications remain optional unless explicitly requested because they expand scope and cost.
-- The default scan policy accepts `CKV_AWS_382` for the minimal EC2 baseline because outbound access is needed for SSM, package repositories, and AWS APIs without a requested VPC endpoint/NAT design. It also accepts the optional S3 scope findings `CKV_AWS_18` (access logging), `CKV2_AWS_61` (lifecycle retention), `CKV_AWS_144` (cross-region replication), and `CKV2_AWS_62` (event notifications) as non-blocking warnings. The scan output explains each acceptance; other Checkov failures continue to block approval.
-- The reply names the resources and why they are configured that way. A configuration error includes what the message means and what changed.
-
-`session_id` is a single directory name: letters, digits, `_`, and `-`, at most 64 characters.
-
-## Approval
-
-A successful `terraform plan` and a passing Checkov scan store a digest of the `*.tf` files. With explicit `skip_checkov: true`, the scan is skipped but the digest can still be stored. A new chat message invalidates it. Failed Terraform validation or a failed plan do not store the digest and do not run `apply`.
-
-- `POST /sessions/{session_id}/apply` with `{"approve": true}` runs `terraform apply` when the apply-plan digest still matches the files.
-- `POST /sessions/{session_id}/plans/destroy` runs `terraform plan -destroy` and deletes nothing. On success it stores a separate digest.
-- `POST /sessions/{session_id}/destroy` with `{"approve": true}` runs `terraform destroy` only for the destroy-plan digest.
-- Before an approved destroy, the agent disables EC2 termination protection when it is enabled so AWS can remove the instance.
-
-A missing approval returns `400`. Missing AWS credentials return `503`. A missing plan or a changed digest returns `409`. AWS is not called in those cases. A chat message, including "yes", does not replace these requests.
-
-## HTTP interface
-
-| Condition | Result |
-| --- | --- |
-| Missing language-model credential | `503` |
-| Invalid `session_id` | `400` |
-| `terraform` missing from `PATH` | Files are kept. `validation.missing_binary` is `true`. |
-| AWS credentials absent | Validation still runs. `plan` is skipped and is not sent to AWS. |
-
-The response body contains `reply`, `files`, `validation`, `plan`, `scan`, and `registry_docs`.
-
-Example:
-
-```http
-POST /sessions/demo/messages
-Content-Type: application/json
-
-{"message":"Private S3 bucket for backups, encrypted, with public access blocked"}
-```
+The estimate uses 730 hours per month for hourly resources. It is not an AWS bill:
+storage, requests, data transfer, backups, taxes, and account-specific discounts
+may change the final amount.
 
 ## Requirements
 
 - Python 3.14
-- Terraform on `PATH` for validation and plan
-- The `tools/terraform-mcp-server.exe` binary for registry documentation. The chat still runs without it.
-- Recommended MCP service command:
+- Node.js and npm
+- Terraform on `PATH`
+- AWS credentials for an AWS `plan`, `apply`, or `destroy`
+- OpenAI API key for the agent
+- Checkov installed for the security scan
 
-```powershell
-.\tools\terraform-mcp-server.exe streamable-http --transport-host 127.0.0.1 --transport-port 8080 --toolsets registry
-```
-
-The backend starts MCP with FastAPI and stops it during shutdown. Set `TERRAFORM_MCP_URL` only when using an external MCP service.
-
-AWS credentials are required for `terraform plan`, `apply`, and `destroy`. Validation runs without them.
-
-## Installation
-
-```powershell
-py -3.14 -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-uvicorn app.main:app --reload
-```
-
-The service listens on [http://127.0.0.1:8000](http://127.0.0.1:8000). Health check: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health).
-
-The Docker image runs the API process. It does not include the Terraform CLI or security scanners.
+Terraform validation can still run without AWS credentials; the plan is skipped
+and clearly reports that it was not sent to AWS.
 
 ## Configuration
 
-Copy `.env.example` to `.env`. Do not commit `.env`.
+Copy `.env.example` to `.env` and configure the required values:
 
-| Variable | Purpose |
-| --- | --- |
-| `OPENAI_API_KEY` | Credential for the language model. It is not written into `.tf` files or logs. |
-| `OPENAI_MODEL` | Optional model identifier. |
-| `AWS_ACCESS_KEY_ID` | Passed only to the Terraform process. |
-| `AWS_SECRET_ACCESS_KEY` | Passed only to the Terraform process. |
-| `AWS_REGION` | Region for the Terraform process when a file does not set one. Default: `eu-central-1`. The agent takes the region from the request and asks when it is missing. |
+```env
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.4-mini
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_SESSION_TOKEN=
+AWS_REGION=eu-central-1
+TERRAFORM_MCP_URL=
+BRAINTRUST_API_KEY=
+```
 
-## Security
+Credentials are passed only to child processes that need them. They are not
+written to Terraform files or sent to the model.
 
-AWS credentials stay in the process environment used by Terraform. They are not placed in the model prompt or in generated files. Values from `.env` are redacted from API error details. Provisioners and external data sources that could execute a program during `plan` are rejected at write time.
+## Provider cache and Terraform MCP
 
-## Roadmap
+Terraform first checks the shared `.terraform-plugin-cache/` filesystem mirror.
+The generated CLI configuration disables automatic upgrades. A `direct {}` fallback
+allows Terraform to download a missing provider from the registry when network
+access is available. Without cache or registry access, initialization fails
+with an explicit error.
 
-- A container image that includes the Terraform CLI and scanners
+To run the bundled Terraform MCP server:
 
-## Evaluations
+```powershell
+.\tools\terraform-mcp-server.exe streamable-http `
+  --transport-host 127.0.0.1 `
+  --transport-port 8080 `
+  --toolsets registry
+```
 
-`python -m evals.run_eval` sends three requests to the model, each in its own temporary directory. AWS credentials are removed for the run, and `apply` is not called. Local checks score the result: no secrets, no provisioners, no plan sent to AWS, and, for a complete request, a passing validation and no public access. A request without a region should end as one question and no files. When `BRAINTRUST_API_KEY` is set, the same 0/1 scores are sent to an `InfraAgent` experiment. Without the key, the run stays on the console.
+The default endpoint is `http://127.0.0.1:8080/mcp`. Set `TERRAFORM_MCP_URL`
+to use an already-running server. Simple edits to an existing workspace skip MCP;
+new configurations and provider documentation requests may use it.
 
-## CI
+## GitHub repository planning
 
-GitHub Actions runs the Python test suite and the frontend lint/build on every
-push and pull request. The Docker image remains a lightweight API image;
-Terraform and Checkov are supplied by the local development environment or a
-dedicated runtime image.
+InfraAgent can connect to GitHub through an OAuth App and list repositories
+available to the signed-in user. Selecting a repository first performs a bounded
+read-only analysis: it detects Terraform files, relevant directories, README
+context, and common application technologies such as Docker, Node.js, Python,
+Kubernetes, and Helm. The UI then recommends either an infrastructure proposal
+for repositories without Terraform or a targeted update for repositories that
+already contain it.
+
+For existing Terraform repositories, the user can import the detected `.tf`
+files while preserving their repository paths in the local session. For
+repositories without Terraform, the analysis is stored as session context and
+the agent uses it to propose infrastructure without pretending to have read the
+entire source repository. Terraform validation, Checkov, and plan review remain
+local steps after generation.
+
+The selected repository is linked to the current session instead of creating a
+duplicate workspace. The session keeps its safe local ID, is renamed to
+`owner/repository`, and stores the bounded analysis in
+`.github-repository-analysis.json`. Reopening that session therefore preserves
+the repository context while keeping Terraform files and generated state local.
+If no deployable application stack is detected, InfraAgent reports that
+infrastructure generation is not recommended rather than creating a generic
+AWS foundation.
+
+This integration is read-only with respect to GitHub: it does not create
+branches, commits, pull requests, or modify repository contents. Configure
+`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`, and
+`GITHUB_FRONTEND_URL` in `.env`, then register the callback URL in the GitHub
+OAuth App settings. The access token is kept in backend memory for the running
+process and is never written to the workspace or sent to the model. Restarting
+the backend disconnects the session. The current OAuth App requests GitHub's
+classic `repo` scope so private repositories can be listed and read; the
+application itself only calls read endpoints. A production deployment should
+replace this with a GitHub App using read-only Contents permissions.
+
+## Running locally
+
+### Backend
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+The API is available at `http://127.0.0.1:8000`.
+
+### Frontend
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+The Vite development server starts on its configured local port and proxies API
+requests to the backend.
+
+## API overview
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Process health check |
+| `POST` | `/sessions/{id}` | Create or touch a session |
+| `POST` | `/sessions/{id}/messages` | Run a non-streaming agent request |
+| `POST` | `/sessions/{id}/messages/stream` | Run an agent request with SSE progress |
+| `GET` | `/sessions/{id}/agent-status` | Restore a persisted agent job |
+| `POST` | `/sessions/{id}/agent-cancel` | Cancel an agent job |
+| `GET` | `/sessions/{id}/conversation` | Read persisted conversation |
+| `GET` | `/sessions/{id}/operations` | Read operation history |
+| `POST` | `/sessions/{id}/plans/apply` | Preview the current apply plan |
+| `POST` | `/sessions/{id}/apply` | Approve and run Terraform apply |
+| `POST` | `/sessions/{id}/plans/destroy` | Create a destroy preview |
+| `POST` | `/sessions/{id}/destroy` | Approve and run Terraform destroy |
+| `POST` | `/sessions/{id}/operations/{op}/cancel` | Cancel a Terraform operation |
+
+`session_id` contains only letters, numbers, `_`, and `-`, with a maximum length
+of 64 characters.
+
+## Testing
+
+Run the backend regression suite:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+Build and lint the frontend:
+
+```powershell
+cd frontend
+npm run build
+npm run lint
+```
+
+Run local model evaluations:
+
+```powershell
+python -m evals.run_eval
+```
+
+The evaluations remove AWS credentials for their run and never call apply or
+destroy. They score both the generated infrastructure and the actual tool trace:
+
+- read before write,
+- review after write,
+- no apply/destroy tool calls,
+- bounded ReAct steps,
+- no secrets or unsafe provisioners,
+- region clarification without writing files.
+
+## License
+
+Apache License 2.0. See [LICENSE](./LICENSE).

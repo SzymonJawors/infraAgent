@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from typing import Callable
 
@@ -11,6 +12,35 @@ from app.services.timing import Timing
 class ReviewState:
     results: tuple[CommandResult, CommandResult, CommandResult] | None = None
     digest: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewReport:
+    ok: bool
+    stage: str
+    category: str
+    retryable: bool
+    message: str
+    suggested_action: str
+    validation: str = ""
+    scan: str = ""
+    plan: str = ""
+
+    def as_tool_result(self) -> str:
+        return json.dumps(
+            {
+                "ok": self.ok,
+                "stage": self.stage,
+                "category": self.category,
+                "retryable": self.retryable,
+                "message": self.message,
+                "suggested_action": self.suggested_action,
+                "validation": self.validation,
+                "scan": self.scan,
+                "plan": self.plan,
+            },
+            ensure_ascii=False,
+        )
 
 
 class ReviewAgent:
@@ -58,7 +88,17 @@ class ReviewAgent:
         if preflight_results:
             validation, plan, scan, preflight_error = preflight_results
             results = (validation, plan, scan)
-            message = f"configuration error, fix the infrastructure and check again\n{preflight_error}"
+            message = ReviewReport(
+                ok=False,
+                stage="preflight",
+                category="infrastructure_preflight",
+                retryable=True,
+                message=preflight_error,
+                suggested_action="Fix the reported infrastructure layout, then run the review again.",
+                validation=validation.output(),
+                scan=scan.output(),
+                plan=plan.output(),
+            ).as_tool_result()
             self.cache[current_digest] = (results, message)
             self.state = ReviewState(results=results, digest=current_digest)
             return message
@@ -66,7 +106,28 @@ class ReviewAgent:
         self.attempts += 1
         if self.attempts > self.max_attempts:
             self.exhausted = True
-            return "Check attempt limit reached. Stop and summarize the remaining error."
+            previous = self.state.results
+            details = (
+                "\n\nLast review result:\n"
+                + "\n\n".join(result.output() for result in previous)
+                if previous is not None
+                else ""
+            )
+            return ReviewReport(
+                ok=False,
+                stage="review",
+                category="attempt_limit",
+                retryable=False,
+                message=(
+                    f"Check attempt limit reached after {self.max_attempts} reviews."
+                    " The last review is included so the remaining issue can be fixed explicitly."
+                ),
+                suggested_action=(
+                    "Stop automatic repairs, inspect the last review result, and make a targeted "
+                    "manual change before running the review again."
+                ),
+                validation=details,
+            ).as_tool_result()
 
         with self.timing.measure("terraform_review"):
             validation, plan = self.terraform.review(
@@ -78,19 +139,9 @@ class ReviewAgent:
             )
         scan = self._scan(validation)
         results = (validation, plan, scan)
-        body = (
-            f"validation {'ok' if validation.ok else 'failed'}\n{model_output(validation.output())}\n"
-            f"scan {'ok' if scan.ok else 'failed'}\n{model_output(scan.output())}\n"
-            f"plan {'ok' if plan.ok else 'failed'}\n{model_output(plan.output())}"
-        ).strip()
-        message = (
-            f"ok\n{body}"
-            if validation.ok and scan.ok and (plan.ok or credentials_missing(plan))
-            else f"configuration error, fix the HCL and check again\n{body}"
-        )
         stop = non_retryable(*results)
-        if stop:
-            message = f"Do not rewrite the files. {stop}\n{body}"
+        report = _review_report(validation, plan, scan, stop)
+        message = report.as_tool_result()
         review_digest = files_digest(self.workspace)
         self.cache[current_digest] = (results, message)
         self.cache[review_digest] = (results, message)
@@ -174,6 +225,83 @@ def skipped_scan(reason: str) -> CommandResult:
         stderr=reason,
         returncode=None,
         policy_warnings=["checkov_skipped"],
+    )
+
+
+def _review_report(
+    validation: CommandResult,
+    plan: CommandResult,
+    scan: CommandResult,
+    stop: str | None,
+) -> ReviewReport:
+    if stop:
+        if validation.missing_binary:
+            stage, category = "terraform_validate", "missing_binary"
+        elif scan.missing_binary:
+            stage, category = "checkov", "missing_binary"
+        elif credentials_missing(plan):
+            stage, category = "terraform_plan", "credentials_missing"
+        elif "timed out" in f"{validation.output()}\n{plan.output()}\n{scan.output()}".lower():
+            stage, category = "terraform_init", "provider_timeout"
+        else:
+            stage, category = "review", "non_retryable"
+        return ReviewReport(
+            ok=False,
+            stage=stage,
+            category=category,
+            retryable=False,
+            message=stop,
+            suggested_action="Do not rewrite the files. Resolve the environment issue before retrying.",
+            validation=model_output(validation.output()),
+            scan=model_output(scan.output()),
+            plan=model_output(plan.output()),
+        )
+    if not validation.ok:
+        return ReviewReport(
+            ok=False,
+            stage="terraform_validate",
+            category="configuration_error",
+            retryable=True,
+            message="Terraform validation failed.",
+            suggested_action="Read the validation output, fix the HCL, and run check_infrastructure again.",
+            validation=model_output(validation.output()),
+            scan=model_output(scan.output()),
+            plan=model_output(plan.output()),
+        )
+    if not scan.ok:
+        return ReviewReport(
+            ok=False,
+            stage="checkov",
+            category="security_finding",
+            retryable=True,
+            message="The security scan found blocking findings.",
+            suggested_action="Fix the actionable Checkov findings and run check_infrastructure again.",
+            validation=model_output(validation.output()),
+            scan=model_output(scan.output()),
+            plan=model_output(plan.output()),
+        )
+    if not plan.ok and not credentials_missing(plan):
+        return ReviewReport(
+            ok=False,
+            stage="terraform_plan",
+            category="plan_error",
+            retryable=True,
+            message="Terraform plan failed.",
+            suggested_action="Fix the reported plan or provider error and run check_infrastructure again.",
+            validation=model_output(validation.output()),
+            scan=model_output(scan.output()),
+            plan=model_output(plan.output()),
+        )
+    return ReviewReport(
+        ok=True,
+        stage="complete",
+        category="passed",
+        retryable=False,
+        message="Terraform validation, security scan, and plan completed successfully.",
+        suggested_action="No repair is required. Wait for approval before apply or destroy.",
+        validation=model_output(validation.output()),
+        scan=model_output(scan.output()),
+        plan=model_output(plan.output()),
     )
 
 

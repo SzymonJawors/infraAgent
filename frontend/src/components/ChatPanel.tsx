@@ -12,7 +12,31 @@ type ChatPanelProps = {
   onMessageChange: (value: string) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
+  onSelectTemplate: (template: string) => void
 }
+
+const QUICK_TEMPLATES = [
+  {
+    title: 'Private S3 bucket',
+    description: 'Encrypted storage with public access blocked',
+    prompt: 'Create a private S3 bucket in eu-central-1 with KMS encryption, versioning, and public access blocked.',
+  },
+  {
+    title: 'VPC and EC2',
+    description: 'A small network with a managed instance',
+    prompt: 'Create a VPC in eu-central-1 with public and private subnets, then add an EC2 instance using SSM instead of SSH.',
+  },
+  {
+    title: 'PostgreSQL database',
+    description: 'Private encrypted RDS PostgreSQL',
+    prompt: 'Create a private PostgreSQL RDS database in eu-central-1 with encryption, automated backups, and security groups limited to the application network.',
+  },
+  {
+    title: 'Lambda API',
+    description: 'Serverless function with an HTTP endpoint',
+    prompt: 'Create a Lambda function and API Gateway HTTP API in eu-central-1 with least-privilege IAM permissions and CloudWatch logging.',
+  },
+]
 
 export function ChatPanel({
   messages,
@@ -24,6 +48,7 @@ export function ChatPanel({
   onMessageChange,
   onSubmit,
   onCancel,
+  onSelectTemplate,
 }: ChatPanelProps) {
   const feedEndRef = useRef<HTMLDivElement>(null)
   const [timingExpanded, setTimingExpanded] = useState(false)
@@ -73,6 +98,27 @@ export function ChatPanel({
         )}
         <div ref={feedEndRef} aria-hidden="true" />
       </div>
+      {messages.length === 1 && !busy && (
+        <div className="quick-templates">
+          <div className="quick-templates-heading">
+            <span className="section-label">Quick start</span>
+            <span>Choose a starting point</span>
+          </div>
+          <div className="quick-template-grid">
+            {QUICK_TEMPLATES.map((template) => (
+              <button
+                type="button"
+                className="quick-template"
+                key={template.title}
+                onClick={() => onSelectTemplate(template.prompt)}
+              >
+                <strong>{template.title}</strong>
+                <span>{template.description}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       {timing.length > 0 && (
         <div className="timing-card">
           <button

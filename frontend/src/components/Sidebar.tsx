@@ -13,6 +13,8 @@ type SidebarProps = {
   onDeleteSession: (id: string) => void
   onRenameSession: (id: string, title: string) => Promise<void>
   operations: OperationRecord[]
+  onOpenOperation: (operation: OperationRecord) => void
+  onDownloadProject: () => void
 }
 
 export function Sidebar({
@@ -27,6 +29,8 @@ export function Sidebar({
   onDeleteSession,
   onRenameSession,
   operations,
+  onOpenOperation,
+  onDownloadProject,
 }: SidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
@@ -51,7 +55,7 @@ export function Sidebar({
           <div className="workspace-icon">⌁</div>
           <div>
             <strong>{workspaceTitle}</strong>
-            <span>Local session</span>
+            <span>{workspaceTitle.includes('/') ? 'GitHub repository' : 'Local session'}</span>
           </div>
           <span className="live-dot" />
         </div>
@@ -111,13 +115,19 @@ export function Sidebar({
         </div>
         <div className="operation-list">
           {operations.slice(0, 6).map((operation) => (
-            <div className="operation-item" key={operation.id}>
+            <button
+              type="button"
+              className="operation-item"
+              key={operation.id}
+              onClick={() => onOpenOperation(operation)}
+            >
               <span className={`operation-dot ${operation.status}`} />
               <span>
                 <strong>{operation.kind}</strong>
                 <small>{operation.status}</small>
               </span>
-            </div>
+              <span className="operation-open">›</span>
+            </button>
           ))}
           {!operations.length && <div className="empty-files">No operations yet.</div>}
         </div>
@@ -148,6 +158,15 @@ export function Sidebar({
         )}
       </div>
       <div className="sidebar-footer">
+        <button
+          type="button"
+          className="download-project"
+          disabled={!files.length}
+          onClick={onDownloadProject}
+        >
+          <span>↓</span>
+          Download Terraform project
+        </button>
         <div className="security-note">
           <span>✦</span>
           <p>

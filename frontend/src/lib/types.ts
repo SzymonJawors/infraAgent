@@ -57,6 +57,7 @@ export type PlanSummary = {
   to_change: number
   to_destroy: number
   resources: string[]
+  resource_actions?: { address: string; action: 'create' | 'change' | 'destroy' | 'replace' }[]
   cost_warnings: string[]
   estimated_monthly_usd?: number | null
   pricing_status?: 'not_requested' | 'complete' | 'partial' | 'unavailable' | 'no_priced_resources'
@@ -91,6 +92,28 @@ export type SessionSummary = {
   title: string
   created_at: string
   updated_at: string
+}
+
+export type GithubRepository = {
+  full_name: string
+  default_branch: string
+  private: boolean
+  html_url: string
+}
+
+export type GithubAnalysis = {
+  repository: string
+  branch: string
+  has_terraform: boolean
+  deployable_stack: boolean
+  terraform_files: string[]
+  terraform_file_count: number
+  directories: string[]
+  file_count: number
+  readme_excerpt: string
+  technologies: string[]
+  recommendation: string
+  suggested_prompt: string
 }
 
 export type ChatMessage = {

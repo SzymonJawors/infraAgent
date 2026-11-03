@@ -31,7 +31,7 @@ class BuilderAgent:
         )
         with timing.measure("builder"):
             result = await self._invoke(graph, prompt, fallback_tools, fast_path=fast_path)
-        for _ in range(0 if fast_path or skip_checkov else self.max_validate - 1):
+        for _ in range(0 if skip_checkov else self.max_validate - 1):
             last_review = review_state()
             if not last_review or last_review[2].ok or should_stop(last_review):
                 break
@@ -42,7 +42,8 @@ class BuilderAgent:
             )
             repair_prompt = (
                 f"{prompt}\n\nMANDATORY REPAIR PASS:\nThe latest infrastructure review still has "
-                f"blocking findings. Do not summarize or ask the user. Read the current workspace, "
+                f"blocking findings. Do not summarize or ask the user. Call read_workspace() before "
+                f"any write, then read the current workspace, "
                 f"edit the Terraform files to fix every finding below, then call check_infrastructure "
                 f"again. Continue until the scan passes or a non-retryable error is reported.\n\n{findings}"
             )
@@ -73,7 +74,7 @@ class BuilderAgent:
         )
         with timing.measure("builder"):
             result = self._invoke_sync(graph, prompt, fallback_tools, fast_path=fast_path)
-        for _ in range(0 if fast_path or skip_checkov else self.max_validate - 1):
+        for _ in range(0 if skip_checkov else self.max_validate - 1):
             last_review = review_state()
             if not last_review or last_review[2].ok or should_stop(last_review):
                 break
@@ -84,7 +85,8 @@ class BuilderAgent:
             )
             repair_prompt = (
                 f"{prompt}\n\nMANDATORY REPAIR PASS:\nThe latest infrastructure review still has "
-                f"blocking findings. Read the current workspace, edit the Terraform files, "
+                f"blocking findings. Call read_workspace() before any write, read the current workspace, "
+                f"edit the Terraform files, "
                 f"then call check_infrastructure again.\n\n{findings}"
             )
             with timing.measure("builder_repair"):
@@ -97,7 +99,7 @@ class BuilderAgent:
         try:
             return await graph.ainvoke(
                 {"messages": [{"role": "user", "content": prompt}]},
-                config={"recursion_limit": 10 if fast_path else 24},
+                config={"recursion_limit": 24 if fast_path else 48},
             )
         except RuntimeError as exc:
             if str(exc).strip().lower() != "event loop is closed":
@@ -109,14 +111,14 @@ class BuilderAgent:
             )
             return await fallback_graph.ainvoke(
                 {"messages": [{"role": "user", "content": prompt}]},
-                config={"recursion_limit": 10 if fast_path else 24},
+                config={"recursion_limit": 24 if fast_path else 48},
             )
 
     def _invoke_sync(self, graph, prompt: str, fallback_tools: list, *, fast_path: bool = False):
         try:
             return graph.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
-                config={"recursion_limit": 10 if fast_path else 24},
+                config={"recursion_limit": 24 if fast_path else 48},
             )
         except RuntimeError as exc:
             if str(exc).strip().lower() != "event loop is closed":
@@ -128,5 +130,5 @@ class BuilderAgent:
             )
             return fallback_graph.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
-                config={"recursion_limit": 10 if fast_path else 24},
+                config={"recursion_limit": 24 if fast_path else 48},
             )

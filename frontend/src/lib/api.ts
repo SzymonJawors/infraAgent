@@ -20,6 +20,30 @@ export async function request<T>(path: string, options?: RequestInit): Promise<T
   return payload as T
 }
 
+export async function downloadProject(sessionId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/sessions/${sessionId}/export`)
+  if (!response.ok) {
+    let detail = 'Could not download the Terraform project.'
+    try {
+      const payload = (await response.json()) as { detail?: string }
+      if (payload.detail) detail = payload.detail
+    } catch {
+      // Keep the user-facing fallback when the server does not return JSON.
+    }
+    throw new Error(detail)
+  }
+
+  const blob = await response.blob()
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `infraagent-${sessionId}.zip`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
 export function getSessionId(): string {
   const stored = localStorage.getItem('infraagent-session')
   if (stored) return stored

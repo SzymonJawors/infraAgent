@@ -4,8 +4,8 @@ import { ChatPanel } from './components/ChatPanel'
 import { Inspector } from './components/Inspector'
 import { Sidebar } from './components/Sidebar'
 import { StatusDot } from './components/StatusDot'
-import { cancelMessageWebSocket, createSessionId, getSessionId, request, streamMessageWebSocket } from './lib/api'
-import type { AgentJobStatus, AgentProgress, AgentTiming, ChatMessage, CommandResponse, ConversationMessage, MessageResponse, OperationRecord, SessionSummary, WorkspaceFile, SessionStatus } from './lib/types'
+import { cancelMessageWebSocket, createSessionId, downloadProject, getSessionId, request, streamMessageWebSocket } from './lib/api'
+import type { AgentJobStatus, AgentProgress, AgentTiming, ChatMessage, CommandResponse, ConversationMessage, GithubAnalysis, GithubRepository, MessageResponse, OperationRecord, SessionSummary, WorkspaceFile, SessionStatus } from './lib/types'
 
 function App() {
   const [sessionId] = useState(getSessionId)
@@ -25,6 +25,12 @@ function App() {
   const [progress, setProgress] = useState<AgentProgress[]>([])
   const [timing, setTiming] = useState<AgentTiming[]>([])
   const [operations, setOperations] = useState<OperationRecord[]>([])
+  const [selectedOperation, setSelectedOperation] = useState<OperationRecord | null>(null)
+  const [githubConnected, setGithubConnected] = useState(false)
+  const [githubRepositories, setGithubRepositories] = useState<GithubRepository[]>([])
+  const [githubAnalysis, setGithubAnalysis] = useState<GithubAnalysis | null>(null)
+  const [showGithub, setShowGithub] = useState(false)
+  const [githubBusy, setGithubBusy] = useState(false)
   const [runCheckov, setRunCheckov] = useState(() => localStorage.getItem('infraagent-run-checkov') !== 'false')
   const [viewer, setViewer] = useState<{ title: string; content: string } | null>(null)
   const activeSession = sessions.find((session) => session.id === sessionId)
@@ -147,6 +153,15 @@ function App() {
     void loadSessionStatus().catch(() => setError('Could not load infrastructure status.'))
   }, [loadSessionStatus])
   useEffect(() => {
+    void request<{ connected: boolean }>(`/sessions/${sessionId}/github/status`)
+      .then((result) => setGithubConnected(result.connected))
+      .catch(() => undefined)
+    if (new URLSearchParams(window.location.search).get('github') === 'connected') {
+      window.history.replaceState({}, '', window.location.pathname)
+      setGithubConnected(true)
+    }
+  }, [sessionId])
+  useEffect(() => {
     void loadOperations().catch(() => setError('Could not load operation history.'))
     const timer = window.setInterval(() => {
       void loadOperations().catch(() => undefined)
@@ -200,6 +215,63 @@ function App() {
       window.location.reload()
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Could not create a new session.')
+    }
+
+  }
+
+  async function openGithub() {
+    if (!githubConnected) {
+      const apiBase = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
+      window.location.assign(`${apiBase}/github/auth?session_id=${encodeURIComponent(sessionId)}`)
+      return
+    }
+    setGithubAnalysis(null)
+    setShowGithub(true)
+    setGithubBusy(true)
+    try {
+      const result = await request<GithubRepository[]>(`/sessions/${sessionId}/github/repositories`)
+      setGithubRepositories(result)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not load GitHub repositories.')
+    } finally {
+      setGithubBusy(false)
+    }
+  }
+
+  async function analyzeRepository(repository: GithubRepository) {
+    setGithubBusy(true)
+    try {
+      const result = await request<GithubAnalysis>(`/sessions/${sessionId}/github/analyze`, {
+        method: 'POST',
+        body: JSON.stringify({
+          full_name: repository.full_name,
+          default_branch: repository.default_branch,
+        }),
+      })
+      setGithubAnalysis(result)
+      await loadSessions()
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not analyze repository.')
+    } finally {
+      setGithubBusy(false)
+    }
+  }
+
+  async function importRepository(repository: GithubAnalysis) {
+    setGithubBusy(true)
+    try {
+      await request(`/sessions/${sessionId}/github/import`, {
+        method: 'POST',
+        body: JSON.stringify({ full_name: repository.repository, default_branch: repository.branch }),
+      })
+      await loadFiles()
+      setShowGithub(false)
+      setGithubAnalysis(null)
+      setMessage(repository.suggested_prompt)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not import repository Terraform.')
+    } finally {
+      setGithubBusy(false)
     }
   }
 
@@ -319,6 +391,18 @@ function App() {
               : result.ok
               ? 'Apply completed successfully. The AWS infrastructure is now deployed.'
               : 'Apply failed. Open the full Terraform output in the Inspector to see the exact error.',
+          },
+        ])
+      }
+      if (path.includes('/plans/apply')) {
+        setMessages((current) => [
+          ...current,
+          {
+            id: Date.now(),
+            role: 'assistant',
+            text: result.ok
+              ? 'The apply plan is ready. Review it, then use Approve & apply to deploy the infrastructure.'
+              : 'The apply plan could not be loaded.',
           },
         ])
       }
@@ -466,6 +550,10 @@ function App() {
             <span className="new-session-label">New session</span>
             <span className="new-session-short">New</span>
           </button>
+          <button type="button" className="github-button" onClick={() => void openGithub()}>
+            <span>◈</span>
+            {githubConnected ? 'GitHub repositories' : 'Connect GitHub'}
+          </button>
         </div>
       </header>
       <main className="workspace-grid">
@@ -487,6 +575,12 @@ function App() {
           onDeleteSession={(id) => void deleteSession(id)}
           onRenameSession={renameSession}
           operations={operations}
+          onOpenOperation={setSelectedOperation}
+          onDownloadProject={() => {
+            void downloadProject(sessionId).catch((requestError) => {
+              setError(requestError instanceof Error ? requestError.message : 'Could not download the Terraform project.')
+            })
+          }}
         />
         <ChatPanel
           messages={messages}
@@ -498,6 +592,7 @@ function App() {
           onMessageChange={setMessage}
           onSubmit={sendMessage}
           onCancel={() => void cancelAgent()}
+          onSelectTemplate={setMessage}
         />
         <Inspector
           checks={checks}
@@ -555,8 +650,108 @@ function App() {
           </section>
         </div>
       )}
+      {selectedOperation && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setSelectedOperation(null)
+        }}>
+          <section className="operation-modal" role="dialog" aria-modal="true" aria-labelledby="operation-title">
+            <div className="viewer-header">
+              <span className="eyebrow">Operation details</span>
+              <button type="button" className="viewer-close" onClick={() => setSelectedOperation(null)} aria-label="Close operation details">×</button>
+            </div>
+            <div className="operation-modal-title">
+              <div>
+                <h2 id="operation-title">{formatOperationKind(selectedOperation.kind)}</h2>
+                <span className={`operation-status ${selectedOperation.status}`}>{selectedOperation.status}</span>
+              </div>
+              <span className={`operation-dot ${selectedOperation.status}`} />
+            </div>
+            <div className="operation-meta">
+              <div><span>Started</span><strong>{formatOperationDate(selectedOperation.started_at)}</strong></div>
+              <div><span>Finished</span><strong>{formatOperationDate(selectedOperation.finished_at)}</strong></div>
+              <div><span>Result</span><strong>{selectedOperation.ok === null || selectedOperation.ok === undefined ? 'Pending' : selectedOperation.ok ? 'Success' : 'Failed'}</strong></div>
+            </div>
+            {selectedOperation.summary && <p className="operation-summary">{selectedOperation.summary}</p>}
+            <div className="section-label">Command</div>
+            <code className="operation-command">{selectedOperation.command || `terraform ${selectedOperation.kind}`}</code>
+            <div className="section-label operation-output-label">Terraform output</div>
+            <pre className="operation-output">{selectedOperation.output || 'No output recorded.'}</pre>
+          </section>
+        </div>
+      )}
+      {showGithub && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setShowGithub(false)
+        }}>
+          <section className="github-modal" role="dialog" aria-modal="true" aria-labelledby="github-title">
+            <div className="viewer-header">
+              <span className="eyebrow">Read-only repository access</span>
+              <button type="button" className="viewer-close" onClick={() => setShowGithub(false)} aria-label="Close GitHub repositories">×</button>
+            </div>
+            <h2 id="github-title">{githubAnalysis ? 'Repository analysis' : 'Choose a GitHub repository'}</h2>
+            <p className="github-help">InfraAgent reads repository metadata only. It never commits, creates branches, or changes GitHub.</p>
+            {githubAnalysis && (
+              <div className="github-analysis">
+                <div className="github-analysis-heading">
+                  <strong>{githubAnalysis.repository}</strong>
+                  <span>{githubAnalysis.has_terraform ? 'Terraform detected' : githubAnalysis.deployable_stack ? 'Application stack detected' : 'No deployable stack'}</span>
+                </div>
+                <div className="github-stats">
+                  <span>{githubAnalysis.file_count} files</span>
+                  <span>{githubAnalysis.terraform_file_count} Terraform files</span>
+                  <span>branch: {githubAnalysis.branch}</span>
+                </div>
+                <div className="github-technologies">
+                  {githubAnalysis.technologies.map((technology) => <span key={technology}>{technology}</span>)}
+                </div>
+                <p className="github-recommendation">{githubAnalysis.recommendation}</p>
+                {githubAnalysis.readme_excerpt && <pre className="github-readme">{githubAnalysis.readme_excerpt}</pre>}
+                <div className="github-analysis-actions">
+                  {githubAnalysis.has_terraform && (
+                    <button type="button" className="primary-button" onClick={() => void importRepository(githubAnalysis)}>
+                      Import Terraform and review
+                    </button>
+                  )}
+                  <button type="button" className="secondary-button" onClick={() => {
+                    setMessage(githubAnalysis.suggested_prompt)
+                    setShowGithub(false)
+                    setGithubAnalysis(null)
+                  }}>
+                    {githubAnalysis.has_terraform ? 'Ask for update proposal' : githubAnalysis.deployable_stack ? 'Propose infrastructure' : 'Ask what to deploy'}
+                  </button>
+                  <button type="button" className="viewer-close" onClick={() => setGithubAnalysis(null)}>Back</button>
+                </div>
+              </div>
+            )}
+            {!githubAnalysis && (githubBusy ? <p className="github-empty">Loading repositories…</p> : (
+              <div className="github-repository-list">
+                {githubRepositories.map((repository) => (
+                  <button type="button" className="github-repository" key={repository.full_name} onClick={() => void analyzeRepository(repository)}>
+                    <span>
+                      <strong>{repository.full_name}</strong>
+                      <small>{repository.private ? 'Private' : 'Public'} · {repository.default_branch}</small>
+                    </span>
+                    <span>Analyze →</span>
+                  </button>
+                ))}
+                {!githubRepositories.length && <p className="github-empty">No repositories available.</p>}
+              </div>
+            ))}
+          </section>
+        </div>
+      )}
     </div>
   )
+}
+
+function formatOperationKind(kind: string): string {
+  return kind.replace(/-/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function formatOperationDate(value: string | null | undefined): string {
+  if (!value) return '—'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
 function parseTiming(message: string): AgentTiming[] {

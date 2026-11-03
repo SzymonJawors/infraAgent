@@ -29,6 +29,14 @@ class RegionDetectionTests(unittest.TestCase):
 
         self.assertEqual(_finalize_reply(reply), "The server is ready.")
 
+    def test_agent_reply_collapses_excessive_spacing(self) -> None:
+        reply = "What changed\n\n\n\n- Added a VPC  \n\n\nWhy\n\n- It isolates the application."
+
+        self.assertEqual(
+            _finalize_reply(reply),
+            "What changed\n\n- Added a VPC\n\nWhy\n\n- It isolates the application.",
+        )
+
     def test_updates_existing_provider_region(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

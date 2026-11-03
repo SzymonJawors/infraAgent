@@ -35,7 +35,7 @@ class AwsPricing:
                 continue
             monthly = price * 730
             total += monthly
-            items.append(f"{label}: about ${monthly:,.2f}/month at 730 hours")
+            items.append(f"{label}: ≈ ${monthly:,.2f}/month")
         if not items:
             return CostEstimate(None, [], "unavailable")
         return CostEstimate(total, items, "partial" if unavailable else "complete")
@@ -43,25 +43,51 @@ class AwsPricing:
     def _resource_specs(self, output: str) -> list[tuple[str, list[tuple[str, str]], str]]:
         location = _aws_location(self.settings.aws_region)
         specs: list[tuple[str, list[tuple[str, str]], str]] = []
-        for match in re.finditer(r"aws_instance\.[^\s{]+[\s\S]{0,1800}?instance_type\s*=\s*\"([^\"]+)\"", output):
-            instance_type = match.group(1)
+        for match in re.finditer(
+            r"#\s+(aws_instance\.[^\s]+)\s+will be (?:created|updated in-place)([\s\S]{0,1800}?)"
+            r"instance_type\s*=\s*\"([^\"]+)\"",
+            output,
+            re.IGNORECASE,
+        ):
+            address, _, instance_type = match.groups()
             specs.append((
                 "AmazonEC2",
                 [("instanceType", instance_type), ("location", location), ("operatingSystem", "Linux"),
                  ("tenancy", "Shared"), ("preInstalledSw", "NA"), ("capacitystatus", "Used")],
-                f"EC2 {instance_type}",
+                f"EC2 {address} ({instance_type})",
             ))
-        for match in re.finditer(r"aws_db_instance\.[^\s{]+[\s\S]{0,2200}?instance_class\s*=\s*\"([^\"]+)\"", output):
-            instance_class = match.group(1)
+        for match in re.finditer(
+            r"#\s+(aws_db_instance\.[^\s]+)\s+will be (?:created|updated in-place)([\s\S]{0,2200}?)"
+            r"instance_class\s*=\s*\"([^\"]+)\"",
+            output,
+            re.IGNORECASE,
+        ):
+            address, _, instance_class = match.groups()
             specs.append((
                 "AmazonRDS",
                 [("instanceType", instance_class), ("location", location), ("databaseEngine", "PostgreSQL"),
                  ("deploymentOption", "Single-AZ")],
-                f"RDS {instance_class}",
+                f"RDS {address} ({instance_class})",
             ))
-        if "aws_nat_gateway." in output:
+        if re.search(r"#\s+aws_s3_bucket\.[^\s]+\s+will be (?:created|updated in-place)", output, re.IGNORECASE):
+            specs.append((
+                "AmazonS3",
+                [("location", location)],
+                "S3 storage and requests",
+            ))
+        if re.search(r"#\s+aws_kms_key\.[^\s]+\s+will be (?:created|updated in-place)", output, re.IGNORECASE):
+            specs.append((
+                "awskms",
+                [("location", location)],
+                "KMS key",
+            ))
+        if re.search(r"#\s+aws_nat_gateway\.[^\s]+\s+will be (?:created|updated in-place)", output, re.IGNORECASE):
             specs.append(("AWSNATGateway", [("location", location)], "NAT Gateway"))
-        return specs
+        unique: dict[tuple[str, str], tuple[str, list[tuple[str, str]], str]] = {}
+        for service, filters, label in specs:
+            address = label.split(" (", 1)[0]
+            unique[(service, address)] = (service, filters, label)
+        return list(unique.values())
 
     def _lookup(self, service: str, filters: list[tuple[str, str]]) -> float | None:
         args = ["aws", "pricing", "get-products", "--service-code", service, "--region", "us-east-1",

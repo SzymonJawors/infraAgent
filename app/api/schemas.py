@@ -13,11 +13,17 @@ class ValidationBody(BaseModel):
     policy_warnings: list[str] = Field(default_factory=list)
 
 
+class ResourceAction(BaseModel):
+    address: str
+    action: str
+
+
 class PlanSummary(BaseModel):
     to_add: int = 0
     to_change: int = 0
     to_destroy: int = 0
     resources: list[str] = Field(default_factory=list)
+    resource_actions: list[ResourceAction] = Field(default_factory=list)
     cost_warnings: list[str] = Field(default_factory=list)
     estimated_monthly_usd: float | None = None
     pricing_status: str = "not_requested"

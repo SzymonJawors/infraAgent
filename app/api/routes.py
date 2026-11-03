@@ -1,15 +1,17 @@
 import json
 import asyncio
+import io
 import queue
 import re
 import threading
+import zipfile
 from difflib import unified_diff
 from collections.abc import Iterator
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi import WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
 from app.core.config import Settings, get_settings
 from app.api.schemas import (
@@ -24,6 +26,7 @@ from app.api.schemas import (
     MessageResponse,
     RenameSessionRequest,
     PlanSummary,
+    ResourceAction,
     SessionSummary,
     SessionsResponse,
     SessionStatus,
@@ -38,6 +41,7 @@ from app.services.approval import (
     clear_receipts,
     drop_receipt,
     matching_receipt,
+    read_receipt,
     write_receipt,
 )
 from app.services.scanner import WorkspaceScanner
@@ -60,6 +64,15 @@ from app.services.workspace_lock import WorkspaceBusyError, workspace_lease
 from app.services.error_analysis import analyze_terraform_error
 from app.services.agent_context import read_conversation
 from app.services.agent_context import detect_region, provider_region, write_conversation
+from app.services.github import (
+    GithubError,
+    authorization_url,
+    exchange_code,
+    list_repositories,
+    new_state,
+    analyze_repository,
+    terraform_files,
+)
 
 router = APIRouter()
 _JOB_STATUS_FILE = ".agent-job.json"
@@ -68,6 +81,8 @@ _JOB_EVENTS: dict[str, threading.Event] = {}
 _OPERATION_RESULTS: dict[tuple[str, int], CommandBody] = {}
 _OPERATION_RESULTS_LOCK = threading.Lock()
 _ACTIVE_SERVICES: dict[tuple[str, int], TerraformService] = {}
+_GITHUB_STATES: dict[str, str] = {}
+_GITHUB_TOKENS: dict[str, str] = {}
 
 
 def _job_status_path(workspace: Path) -> Path:
@@ -181,6 +196,104 @@ def get_conversation(session_id: str) -> ConversationResponse:
     )
 
 
+@router.get("/github/auth")
+def github_auth(session_id: str) -> RedirectResponse:
+    settings = get_settings()
+    if not settings.github_client_id or not settings.github_client_secret:
+        raise HTTPException(status_code=503, detail="GitHub OAuth is not configured")
+    _workspace_or_400(session_id, create=True)
+    state = new_state()
+    _GITHUB_STATES[state] = session_id
+    return RedirectResponse(
+        authorization_url(settings.github_client_id, settings.github_redirect_uri, state)
+    )
+
+
+@router.get("/github/callback")
+def github_callback(code: str, state: str) -> RedirectResponse:
+    session_id = _GITHUB_STATES.pop(state, None)
+    settings = get_settings()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Invalid or expired GitHub OAuth state")
+    try:
+        _GITHUB_TOKENS[session_id] = exchange_code(
+            settings.github_client_id,
+            settings.github_client_secret,
+            code,
+            settings.github_redirect_uri,
+        )
+    except GithubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return RedirectResponse(f"{settings.github_frontend_url}/?github=connected")
+
+
+@router.get("/sessions/{session_id}/github/status")
+def github_status(session_id: str) -> dict[str, bool]:
+    _workspace_or_400(session_id)
+    return {"connected": session_id in _GITHUB_TOKENS}
+
+
+@router.get("/sessions/{session_id}/github/repositories")
+def github_repositories(session_id: str) -> list[dict[str, object]]:
+    _workspace_or_400(session_id)
+    token = _GITHUB_TOKENS.get(session_id)
+    if not token:
+        raise HTTPException(status_code=401, detail="Connect GitHub first")
+    try:
+        return [repository.__dict__ for repository in list_repositories(token)]
+    except GithubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{session_id}/github/import")
+def import_github_terraform(session_id: str, body: dict[str, str]) -> dict[str, object]:
+    workspace = _workspace_or_400(session_id)
+    token = _GITHUB_TOKENS.get(session_id)
+    full_name = body.get("full_name", "")
+    branch = body.get("default_branch", "main")
+    if not token:
+        raise HTTPException(status_code=401, detail="Connect GitHub first")
+    try:
+        files = terraform_files(token, full_name, branch)
+    except GithubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not files:
+        raise HTTPException(status_code=404, detail="No Terraform files found in this repository")
+    for path, content in files.items():
+        target = (workspace / path).resolve()
+        if workspace.resolve() not in target.parents or target.suffix != ".tf":
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    clear_receipts(workspace)
+    return {"repository": full_name, "branch": branch, "files": sorted(files)}
+
+
+@router.post("/sessions/{session_id}/github/analyze")
+def analyze_github_repository(session_id: str, body: dict[str, str]) -> dict[str, object]:
+    workspace = _workspace_or_400(session_id)
+    token = _GITHUB_TOKENS.get(session_id)
+    full_name = body.get("full_name", "")
+    branch = body.get("default_branch", "main")
+    if not token:
+        raise HTTPException(status_code=401, detail="Connect GitHub first")
+    if not full_name or not branch:
+        raise HTTPException(status_code=400, detail="Repository and branch are required")
+    try:
+        analysis = analyze_repository(token, full_name, branch)
+    except GithubError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try:
+        rename_session(session_id, full_name)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail="Could not link repository to session") from exc
+    (workspace / ".github-repository-analysis.json").write_text(
+        json.dumps(analysis, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    return analysis
+
+
 @router.get("/sessions/{session_id}/agent-status", response_model=AgentJobStatus)
 def get_agent_status(session_id: str) -> AgentJobStatus:
     return _read_job_status(_workspace_or_400(session_id))
@@ -286,7 +399,12 @@ def post_message(session_id: str, body: MessageRequest) -> MessageResponse:
                 skip_checkov=body.skip_checkov,
             )
             if turn.plan.ok and turn.scan.ok:
-                write_receipt(workspace, "apply")
+                write_receipt(
+                    workspace,
+                    "apply",
+                    plan_output=turn.plan.full_output(),
+                    session_id=session_id,
+                )
             response = _response(turn, _workspace_changes(workspace, before))
     except WorkspaceBusyError as exc:
         raise HTTPException(
@@ -355,7 +473,12 @@ def post_message_stream(session_id: str, body: MessageRequest) -> StreamingRespo
                 body.skip_checkov,
             )
             if turn.plan.ok and turn.scan.ok:
-                write_receipt(workspace, "apply")
+                write_receipt(
+                    workspace,
+                    "apply",
+                    plan_output=turn.plan.full_output(),
+                    session_id=session_id,
+                )
             response = _response(turn, _workspace_changes(workspace, before))
             _write_job_status(workspace, AgentJobStatus(status="completed", result=response))
             finish_operation(session_id, operation_id, "completed", response.reply)
@@ -443,7 +566,12 @@ async def post_message_websocket(websocket: WebSocket, session_id: str) -> None:
                 body.skip_checkov,
             )
             if turn.plan.ok and turn.scan.ok:
-                write_receipt(workspace, "apply")
+                write_receipt(
+                    workspace,
+                    "apply",
+                    plan_output=turn.plan.full_output(),
+                    session_id=session_id,
+                )
             response = _response(turn, _workspace_changes(workspace, before))
             _write_job_status(workspace, AgentJobStatus(status="completed", result=response))
             finish_operation(session_id, operation_id, "completed", response.reply)
@@ -508,6 +636,41 @@ def get_files(session_id: str) -> FilesResponse:
     )
 
 
+@router.get("/sessions/{session_id}/export")
+def export_session(session_id: str) -> Response:
+    workspace = _workspace_or_400(session_id)
+    terraform_files = WorkspaceScanner(workspace).files()
+    if not terraform_files:
+        raise HTTPException(status_code=404, detail="No Terraform files to export")
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for name in terraform_files:
+            bundle.write(workspace / name, arcname=name)
+        bundle.writestr(
+            "README.md",
+            (
+                "# Terraform project\n\n"
+                "Generated by InfraAgent. Review the Terraform plan and configure "
+                "your AWS credentials before running Terraform locally.\n\n"
+                "```powershell\n"
+                "terraform init\n"
+                "terraform plan\n"
+                "```\n"
+            ),
+        )
+        if (workspace / ".terraform.lock.hcl").is_file():
+            bundle.write(workspace / ".terraform.lock.hcl", arcname=".terraform.lock.hcl")
+
+    archive.seek(0)
+    filename = f"infraagent-{session_id}.zip"
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.post("/sessions/{session_id}/plans/destroy", response_model=CommandBody)
 def post_destroy_plan(session_id: str) -> CommandBody:
     workspace = _workspace_or_400(session_id, create=True)
@@ -531,7 +694,12 @@ def post_destroy_plan(session_id: str) -> CommandBody:
         try:
             result = service.plan_destroy()
             if result.ok and _destroy_plan_has_changes(result.full_output()):
-                write_receipt(workspace, "destroy")
+                write_receipt(
+                    workspace,
+                    "destroy",
+                    plan_output=result.full_output(),
+                    session_id=session_id,
+                )
             else:
                 drop_receipt(workspace, "destroy")
             final_body = _command_body(result, operation_id)
@@ -581,6 +749,22 @@ def post_destroy_plan(session_id: str) -> CommandBody:
 @router.post("/sessions/{session_id}/apply", response_model=CommandBody)
 def post_apply(session_id: str, body: ApprovalRequest) -> CommandBody:
     return _run_approved(session_id, body, "apply")
+
+
+@router.post("/sessions/{session_id}/plans/apply", response_model=CommandBody)
+def post_apply_plan(session_id: str) -> CommandBody:
+    workspace = _workspace_or_400(session_id)
+    receipt = read_receipt(workspace, "apply")
+    if receipt is None:
+        raise HTTPException(status_code=409, detail="No matching apply plan for the current files")
+    output = receipt.get("plan_output", "")
+    return CommandBody(
+        ok=True,
+        command="terraform plan",
+        output=output or "The reviewed apply plan is ready.",
+        status="completed",
+        plan_summary=_plan_summary(output),
+    )
 
 
 @router.post("/sessions/{session_id}/destroy", response_model=CommandBody)
@@ -832,6 +1016,14 @@ def _plan_summary(output: str, *, destroy: bool = False) -> PlanSummary:
         re.IGNORECASE,
     )
     resources = sorted(set(re.findall(r"#\s+([^\s]+)\s+will be", output)))
+    resource_actions = sorted([
+        ResourceAction(address=address, action=_resource_action(verb))
+        for address, verb in re.findall(
+            r"#\s+([^\s]+)\s+will be\s+(created|updated|destroyed|replaced)",
+            output,
+            re.IGNORECASE,
+        )
+    ], key=lambda item: item.address)
     destroy_resources = sorted(set(re.findall(
         r"#\s+([^\s]+)\s+will be destroyed",
         output,
@@ -847,10 +1039,18 @@ def _plan_summary(output: str, *, destroy: bool = False) -> PlanSummary:
         warnings.append("EC2 instance and EBS storage incur hourly and storage charges.")
     if "aws_cloudwatch_log_group." in lower:
         warnings.append("CloudWatch Logs incur ingestion and storage charges.")
+    if "aws_s3_bucket." in lower:
+        warnings.append("S3 incurs storage, request, and data transfer charges; lifecycle and retention affect the final bill.")
+    if "aws_kms_key." in lower:
+        warnings.append("Customer-managed KMS keys incur a monthly key charge plus API request charges.")
     if "aws_nat_gateway." in lower:
         warnings.append("NAT Gateway has hourly and per-GB processing charges.")
     if not match:
-        return PlanSummary(resources=resources, cost_warnings=warnings)
+        return PlanSummary(
+            resources=resources,
+            resource_actions=resource_actions,
+            cost_warnings=warnings,
+        )
     to_destroy = int(match.group(3))
     if destroy and destroy_resources:
         # Terraform can emit a stale/partial summary when refresh output is
@@ -858,10 +1058,26 @@ def _plan_summary(output: str, *, destroy: bool = False) -> PlanSummary:
         # authoritative for the review shown to the user.
         to_destroy = len(destroy_resources)
         resources = destroy_resources
+        resource_actions = [
+            ResourceAction(address=address, action="destroy")
+            for address in destroy_resources
+        ]
     return PlanSummary(
         to_add=int(match.group(1)),
         to_change=int(match.group(2)),
         to_destroy=to_destroy,
         resources=resources,
+        resource_actions=resource_actions,
         cost_warnings=warnings,
     )
+
+
+def _resource_action(verb: str) -> str:
+    normalized = verb.lower()
+    if normalized == "created":
+        return "create"
+    if normalized == "destroyed":
+        return "destroy"
+    if normalized == "replaced":
+        return "replace"
+    return "change"

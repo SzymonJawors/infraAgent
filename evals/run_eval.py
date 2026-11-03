@@ -12,7 +12,7 @@ from app.core.config import get_settings
 from app.services.agent import InfraAgent
 from app.services.scanner import WorkspaceScanner
 from evals.braintrust_export import experiment_row, publish
-from evals.score import CASES, score_case
+from evals.score import CASES, score_case, score_workflow
 
 _AWS_ENV = (
     "AWS_ACCESS_KEY_ID",
@@ -47,6 +47,7 @@ def main() -> int:
                 scan_ok=turn.scan.ok,
                 plan_output=turn.plan.output(),
             )
+            scores.update(score_workflow(turn.tool_calls))
             ok = all(scores.values())
             failed += not ok
             rows.append(

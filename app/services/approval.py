@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 _KINDS = ("apply", "destroy")
+APPROVAL_TTL_SECONDS = 30 * 60
 
 
 def files_digest(workspace: Path) -> str:
@@ -30,13 +31,21 @@ def clear_receipts(workspace: Path) -> None:
         drop_receipt(workspace, kind)
 
 
-def write_receipt(workspace: Path, kind: str) -> None:
+def write_receipt(
+    workspace: Path,
+    kind: str,
+    *,
+    plan_output: str = "",
+    session_id: str | None = None,
+) -> None:
     path = receipt_path(workspace, kind)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "kind": kind,
         "digest": files_digest(workspace),
         "created_at": datetime.now(UTC).isoformat(),
+        "session_id": session_id or workspace.name,
+        "plan_output": plan_output,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -46,11 +55,26 @@ def drop_receipt(workspace: Path, kind: str) -> None:
 
 
 def matching_receipt(workspace: Path, kind: str) -> bool:
+    return read_receipt(workspace, kind) is not None
+
+
+def read_receipt(workspace: Path, kind: str) -> dict | None:
     path = receipt_path(workspace, kind)
     if not path.is_file():
-        return False
+        return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
-    return data.get("kind") == kind and data.get("digest") == files_digest(workspace)
+        return None
+    if data.get("kind") != kind or data.get("digest") != files_digest(workspace):
+        return None
+    try:
+        created_at = datetime.fromisoformat(data["created_at"])
+    except (KeyError, TypeError, ValueError):
+        drop_receipt(workspace, kind)
+        return None
+    age = (datetime.now(UTC) - created_at).total_seconds()
+    if age < 0 or age > APPROVAL_TTL_SECONDS:
+        drop_receipt(workspace, kind)
+        return None
+    return data
