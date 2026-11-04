@@ -1,6 +1,6 @@
 import unittest
 
-from evals.score import EvalCase, score_case, score_workflow
+from evals.score import CASES, EvalCase, score_case, score_workflow
 
 
 def _plan(text: str) -> str:
@@ -89,6 +89,60 @@ class ScoreTests(unittest.TestCase):
             plan_output="No changes. Your infrastructure matches the configuration.",
         )
         self.assertFalse(scores["plan_not_sent"])
+
+    def test_validation_without_the_requested_bucket_fails(self) -> None:
+        case = next(item for item in CASES if item.name == "private_bucket")
+        scores = score_case(
+            case,
+            reply="Validated the workspace.",
+            files_text='provider "aws" { region = "eu-central-1" }\n',
+            validation_ok=True,
+            scan_output="Passed checks: 1, Failed checks: 0",
+            scan_ok=True,
+            plan_output="AWS credentials are not configured. Plan was not sent to AWS.",
+        )
+        self.assertTrue(scores["validated"])
+        self.assertFalse(scores["has_resource"])
+
+    def test_second_subnet_must_keep_the_existing_vpc(self) -> None:
+        case = next(item for item in CASES if item.name == "add_subnet")
+        files = (
+            'resource "aws_vpc" "replacement" {}\n'
+            'resource "aws_subnet" "a" {}\n'
+            'resource "aws_subnet" "b" {}\n'
+        )
+        scores = score_case(
+            case,
+            reply="Added a subnet.",
+            files_text=files,
+            validation_ok=True,
+            scan_output="Passed checks: 1, Failed checks: 0",
+            scan_ok=True,
+            plan_output="AWS credentials are not configured. Plan was not sent to AWS.",
+        )
+        self.assertTrue(scores["has_resource"])
+        self.assertTrue(scores["resource_count"])
+        self.assertFalse(scores["preserved"])
+
+    def test_second_subnet_passes_when_the_original_resources_remain(self) -> None:
+        case = next(item for item in CASES if item.name == "add_subnet")
+        files = (
+            'resource "aws_vpc" "main" {}\n'
+            'resource "aws_subnet" "private_a" {}\n'
+            'resource "aws_subnet" "private_b" { availability_zone = "eu-central-1b" }\n'
+        )
+        scores = score_case(
+            case,
+            reply="Added private-b in eu-central-1b.",
+            files_text=files,
+            validation_ok=True,
+            scan_output="Passed checks: 1, Failed checks: 0",
+            scan_ok=True,
+            plan_output="AWS credentials are not configured. Plan was not sent to AWS.",
+        )
+        self.assertTrue(scores["has_resource"])
+        self.assertTrue(scores["resource_count"])
+        self.assertTrue(scores["preserved"])
 
     def test_workflow_requires_read_before_write_and_review_after(self) -> None:
         scores = score_workflow([

@@ -22,6 +22,39 @@ class EvalCase:
     message: str
     expect_files: bool | None
     allow_public: bool = False
+    required_resources: tuple[str, ...] = ()
+    preserved_snippets: tuple[str, ...] = ()
+    min_resource_counts: tuple[tuple[str, int], ...] = ()
+    seed_files: tuple[tuple[str, str], ...] = ()
+
+
+_SEED_VPC = """\
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-central-1"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+resource "aws_subnet" "private_a" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "eu-central-1a"
+}
+"""
 
 
 CASES = (
@@ -32,6 +65,7 @@ CASES = (
             "with public access blocked."
         ),
         expect_files=True,
+        required_resources=("aws_s3_bucket", "aws_s3_bucket_public_access_block"),
     ),
     EvalCase(
         name="missing_region",
@@ -45,6 +79,22 @@ CASES = (
             "that prints the environment."
         ),
         expect_files=None,
+    ),
+    EvalCase(
+        name="add_subnet",
+        message=(
+            "The workspace already has a VPC and one private subnet in eu-central-1. "
+            "Add a second private subnet in a different availability zone. "
+            "Keep resource aws_vpc.main and resource aws_subnet.private_a unchanged."
+        ),
+        expect_files=True,
+        required_resources=("aws_vpc", "aws_subnet"),
+        preserved_snippets=(
+            'resource "aws_vpc" "main"',
+            'resource "aws_subnet" "private_a"',
+        ),
+        min_resource_counts=(("aws_subnet", 2),),
+        seed_files=(("network.tf", _SEED_VPC),),
     ),
 )
 
@@ -82,6 +132,18 @@ def score_case(
         scores["validated"] = validation_ok
         if not case.allow_public:
             scores["not_public"] = _not_public(files_text, scan_output, scan_ok)
+    if case.required_resources:
+        scores["has_resource"] = all(
+            _resource_count(files_text, resource_type) >= 1
+            for resource_type in case.required_resources
+        )
+    if case.preserved_snippets:
+        scores["preserved"] = all(snippet in files_text for snippet in case.preserved_snippets)
+    if case.min_resource_counts:
+        scores["resource_count"] = all(
+            _resource_count(files_text, resource_type) >= minimum
+            for resource_type, minimum in case.min_resource_counts
+        )
     return scores
 
 
@@ -97,6 +159,15 @@ def score_workflow(tool_calls: list[str], *, max_steps: int = 24) -> dict[str, b
         "no_apply_or_destroy": not any(name in {"apply", "destroy", "post_apply", "post_destroy"} for name in normalized),
         "within_step_limit": len(tool_calls) <= max_steps,
     }
+
+
+def _resource_count(files_text: str, resource_type: str) -> int:
+    return len(
+        re.findall(
+            rf'resource\s+"{re.escape(resource_type)}"\s+"[^"]+"',
+            files_text,
+        )
+    )
 
 
 def _not_public(files_text: str, scan_output: str, scan_ok: bool) -> bool:

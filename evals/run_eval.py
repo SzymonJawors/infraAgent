@@ -1,7 +1,8 @@
 """Run the local InfraAgent evaluations.
 
 The model key is used. AWS credentials are removed for the run, and apply is
-never called. Each case gets a fresh temporary directory.
+never called. Each case gets a fresh temporary directory. A case may seed
+that directory with Terraform before the agent runs.
 """
 
 import os
@@ -36,6 +37,10 @@ def main() -> int:
     try:
         for case in CASES:
             workspace = Path(tempfile.mkdtemp(prefix=f"infraagent-{case.name}-"))
+            for relative, content in case.seed_files:
+                target = workspace / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
             turn = InfraAgent(workspace, settings).run(case.message)
             files_text = WorkspaceScanner(workspace).read()
             scores = score_case(
