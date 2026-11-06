@@ -11,7 +11,14 @@ from langgraph.errors import GraphRecursionError
 
 from app.core.config import Settings
 from app.services.checkov_scan import CheckovService
-from app.services.hcl_guard import rejected_hcl
+from app.services.hcl_guard import (
+    align_hcl,
+    apply_version_overrides,
+    engine_version_problem,
+    rejected_hcl,
+    requested_engine_version,
+    requested_provider_constraints,
+)
 from app.services.scanner import WorkspaceScanner
 from app.services.approval import files_digest
 from app.services.terraform import CommandResult, TerraformService
@@ -38,7 +45,9 @@ current session workspace, validate it, and explain only what actually changed.
 # Terraform rules
 - Use responsibility-based files (`versions.tf`, `provider.tf`, `network.tf`, `compute.tf`,
   `database.tf`, `storage.tf`, `outputs.tf`) without duplicates or empty files.
-- Use the confirmed region, `hashicorp/aws ~> 6.0`, and `hashicorp/random ~> 3.0` only when needed.
+- Use the confirmed region. Provider versions default to `hashicorp/aws ~> 6.0` and, only when
+  needed, `hashicorp/random ~> 3.0`. If the user explicitly requests another provider version,
+  write that exact constraint in `versions.tf`. A different value is rewritten before init.
   Treat `eu central`, `eu-central`, and `Frankfurt` as `eu-central-1`.
 - Never write credentials, passwords, placeholders, provisioners, `local-exec`, `remote-exec`, or
   `data "external"`. Use private subnets, encryption, blocked S3 public access, customer-managed
@@ -51,8 +60,9 @@ current session workspace, validate it, and explain only what actually changed.
   service; do not reuse an RDS-only key.
 - RDS subnet groups require two subnets in different AZs. Add a second private subnet and route
   association when an existing VPC has only one.
-- Never guess `aws_db_instance.engine_version`; omit it unless the exact regional version is
-  confirmed. Do not enable EC2 termination protection by default.
+- Never guess `aws_db_instance.engine_version`. Omit it unless the user explicitly requests an
+  exact engine version, and then use only that value. Do not enable EC2 termination protection
+  by default.
 - Never hardcode AMI IDs. Use an `aws_ami` data source for the requested architecture and Amazon
   Linux 2023. Do not open `0.0.0.0/0` unless explicitly requested.
 - Do not add replication, access logging, or event notifications only for generic Checkov findings.
@@ -141,7 +151,7 @@ class InfraAgent:
             _MAX_VALIDATE,
             timing,
             skip_checkov,
-            preflight=lambda: _database_subnet_group_issue(scanner.read()),
+            preflight=lambda: _database_subnet_group_issue(scanner.read(), message),
         )
         workspace_read = False
 
@@ -154,7 +164,12 @@ class InfraAgent:
             name = Path(filename).name
             if name != filename or not name.endswith(".tf") or name in {".tf"}:
                 return "Rejected: only a plain *.tf filename is allowed."
-            rejected = rejected_hcl(content)
+            target = (self.workspace / name).resolve()
+            if target.parent != self.workspace.resolve():
+                return "Rejected: path escapes the session directory."
+            previous = target.read_text(encoding="utf-8") if target.is_file() else ""
+            content = align_hcl(content, message=message, filename=name, previous=previous)
+            rejected = rejected_hcl(content, message=message, filename=name)
             if rejected:
                 return rejected
             if (
@@ -166,9 +181,6 @@ class InfraAgent:
                     "Only enable disable_api_termination after the user explicitly "
                     "requests termination protection."
                 )
-            target = (self.workspace / name).resolve()
-            if target.parent != self.workspace.resolve():
-                return "Rejected: path escapes the session directory."
             if len(content.encode("utf-8")) > 200_000:
                 return "Rejected: file is larger than 200 KB."
             if target.is_file() and target.read_text(encoding="utf-8") == content:
@@ -185,8 +197,14 @@ class InfraAgent:
             existing = scanner.read()
             return existing or "Workspace is empty."
 
+        def sync_versions() -> list[str]:
+            with workspace_lease(self.workspace):
+                return apply_version_overrides(self.workspace, message)
+
         def check_infrastructure() -> str:
             """Validate the files, scan them, and run terraform plan when AWS credentials exist."""
+            ensure_active()
+            sync_versions()
             return reviewer.check(ensure_active)
 
         conversation_path = self.workspace / ".agent-conversation.json"
@@ -240,6 +258,14 @@ class InfraAgent:
                 ),
                 registry_docs=False,
             )
+        corrected = sync_versions() if scanner.files() else []
+        if corrected:
+            existing = scanner.read()
+            context.append(
+                "Versions already stored in this session were corrected in: "
+                + ", ".join(corrected)
+                + "."
+            )
         if existing:
             context.append(_workspace_summary(existing, scanner.files()))
             context.append(
@@ -249,6 +275,22 @@ class InfraAgent:
             )
         else:
             context.append("The session has no Terraform files yet.")
+        provider_constraints = requested_provider_constraints(message)
+        if provider_constraints:
+            rendered = ", ".join(
+                f"hashicorp/{name} {constraint}" for name, constraint in provider_constraints.items()
+            )
+            context.append(
+                f"Confirmed provider versions: {rendered}. "
+                "These constraints are written into versions.tf before Terraform init. "
+                "Do not change them back to the default."
+            )
+        engine_version = requested_engine_version(message)
+        if engine_version:
+            context.append(
+                f"Confirmed RDS engine_version: {engine_version}. "
+                "This exact value is written into aws_db_instance. Any other engine_version is replaced."
+            )
         repository_context = _read_repository_context(self.workspace)
         if repository_context:
             context.append(repository_context)
@@ -391,6 +433,8 @@ class InfraAgent:
             "Reviewing the generated infrastructure...",
             "Terraform review" if skip_checkov else "Terraform and Checkov review",
         )
+        if scanner.files():
+            sync_versions()
         if scanner.files() and reviewer.current() is not None and reviewer.state.digest == files_digest(self.workspace):
             validation, plan, scan = reviewer.current()
         elif scanner.files():
@@ -570,18 +614,11 @@ def _command_message(command: str) -> str:
     return "Running an infrastructure command..."
 
 
-def _database_subnet_group_issue(terraform: str) -> str | None:
+def _database_subnet_group_issue(terraform: str, message: str = "") -> str | None:
     """Catch the AWS RDS two-AZ requirement before approval/apply."""
-    if re.search(
-        r'resource\s+"aws_db_instance"\s+"[^"]+"\s*\{(?:(?!\n\}).)*?^\s*engine_version\s*=',
-        terraform,
-        re.IGNORECASE | re.MULTILINE | re.DOTALL,
-    ):
-        return (
-            "RDS engine_version is hardcoded to a possibly unavailable version. "
-            "Remove engine_version or replace it only with a version confirmed "
-            "available in the selected region and instance configuration."
-        )
+    engine_issue = engine_version_problem(terraform, message)
+    if engine_issue:
+        return engine_issue
     for block in re.finditer(
         r'resource\s+"aws_db_subnet_group"\s+"[^"]+"\s*\{(.*?)\n\}',
         terraform,
