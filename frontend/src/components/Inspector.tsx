@@ -37,7 +37,13 @@ export function Inspector({
   onCancelOperation,
 }: InspectorProps) {
   const [showExplanation, setShowExplanation] = useState(false)
-  const canApply = checks?.plan.ok === true && checks.scan.ok === true
+  const hasGeneratedFiles = files.length > 0
+  const hasReviewOutput = Boolean(
+    checks &&
+    [checks.validation.output, checks.plan.output, checks.scan.output].some((output) => output.trim()),
+  )
+  const review = hasGeneratedFiles && hasReviewOutput ? checks : null
+  const canApply = review?.plan.ok === true && review.scan.ok === true
   const isApplied = sessionStatus?.status === 'applied'
   const canDestroy =
     lastCommand?.ok === true &&
@@ -58,7 +64,7 @@ export function Inspector({
           <span>
             {isApplied
               ? `${sessionStatus?.managed_resources ?? 0} managed Terraform resource${sessionStatus?.managed_resources === 1 ? '' : 's'}`
-              : checks
+              : review
                 ? 'Review checks below'
                 : files.length
                   ? 'Terraform files loaded'
@@ -67,18 +73,18 @@ export function Inspector({
         </div>
       </div>
       <div className="check-list">
-        <CheckRow label="Terraform validation" result={checks?.validation} />
-        <CheckRow label="Security scan" result={checks?.scan} />
-        <CheckRow label="Terraform plan" result={checks?.plan} />
+        <CheckRow label="Terraform validation" result={review?.validation} />
+        <CheckRow label="Security scan" result={review?.scan} />
+        <CheckRow label="Terraform plan" result={review?.plan} />
         <div className="check-row">
-          <StatusDot ok={Boolean(checks?.registry_docs)} warning />
+          <StatusDot ok={Boolean(review?.registry_docs)} warning />
           <span>Registry documentation</span>
-          <em>{checks?.registry_docs ? 'Available' : 'Optional'}</em>
+          <em>{review?.registry_docs ? 'Available' : 'Optional'}</em>
         </div>
-        {checks?.plan_summary && (
+        {review?.plan_summary && (
           <PlanSummaryCard
-            summary={checks.plan_summary}
-            planOutput={checks.plan.output}
+            summary={review.plan_summary}
+            planOutput={review.plan.output}
             showExplanation={showExplanation}
             onToggleExplanation={() => setShowExplanation((visible) => !visible)}
           />

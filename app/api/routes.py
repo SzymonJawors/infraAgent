@@ -141,13 +141,24 @@ def _region_clarification(workspace: Path, message: str) -> MessageResponse | No
             {"role": "assistant", "content": reply},
         ],
     )
-    empty = ValidationBody(ok=True, missing_binary=False, output="")
     return MessageResponse(
         reply=reply,
         files=WorkspaceScanner(workspace).files(),
-        validation=empty,
-        plan=empty,
-        scan=empty,
+        validation=ValidationBody(
+            ok=False,
+            missing_binary=False,
+            output="No Terraform files were written.",
+        ),
+        plan=ValidationBody(
+            ok=False,
+            missing_binary=False,
+            output="Skipped because no Terraform files were written.",
+        ),
+        scan=ValidationBody(
+            ok=False,
+            missing_binary=False,
+            output="Skipped because no Terraform files were written.",
+        ),
         registry_docs=False,
     )
 
